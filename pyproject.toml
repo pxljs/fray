@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fray"
+dynamic = ["version"]
+description = "A JIT-based high-performance operator framework"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[tool.setuptools]
+packages = ["fray", "fray.jit", "fray.jit_kernels"]
+# packages = {find = {}}
+
+[tool.setuptools_scm]
+version_scheme = "no-guess-dev"
+local_scheme = "node-and-date"
+
+[tool.setuptools.package-data]
+fray = [
+    "include/cute/**/*",
+    "include/cutlass/**/*",
+    "include/gemm/**/*",
+    "include/scan/**/*",
+    "include/reduce/**/*",
+    "include/softmax/**/*",
+    "include/flash_attn/**/*",
+]
