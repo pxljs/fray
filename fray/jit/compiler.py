@@ -41,7 +41,7 @@ def get_extra_include_dirs() -> Tuple[str, ...]:
     return tuple(path for path in candidate_dirs if os.path.isdir(path))
 
 @functools.lru_cache(maxsize=None)
-def get_yan_version() -> str:
+def get_fray_version() -> str:
     base_include_dir = get_jit_include_dir()
     assert os.path.exists(base_include_dir), f'Cannot find Fray include directory {base_include_dir}'
     
@@ -104,7 +104,7 @@ def get_nvcc_compiler() -> Tuple[str, str]:
     
     raise RuntimeError('Cannot find any available NVCC compiler with version >= 12.3. '
                       'Please make sure CUDA Toolkit 12.3 or higher is installed and set CUDA_HOME '
-                      'or YAN_NVCC_COMPILER environment variable.')
+                      'or FRAY_NVCC_COMPILER environment variable.')
 
 
 @functools.lru_cache(maxsize=None)
@@ -119,7 +119,7 @@ def get_default_user_dir():
         base_dir = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
         return os.path.join(base_dir, 'fray')
     else:
-        # Use ~/.yan on Linux/macOS
+        # Use ~/.fray on Linux/macOS
         return os.path.expanduser('~/.cache/fray')
 
 
@@ -228,14 +228,14 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     # Build signature
     enable_sass_opt = get_nvcc_compiler()[1] <= '12.8' and int(os.getenv('FRAY_DISABLE_FFMA_INTERLEAVE', 0)) == 0
-    signature = f'{name}$${get_yan_version()}$${code}$${get_nvcc_compiler()}$${flags}$${enable_sass_opt}$${IS_WINDOWS}'
+    signature = f'{name}$${get_fray_version()}$${code}$${get_nvcc_compiler()}$${flags}$${enable_sass_opt}$${IS_WINDOWS}'
     name = f'kernel.{name}.{hash_to_hex(signature)}'
     path = os.path.join(get_cache_dir(), name)
 
     # Check runtime cache or file system hit
     global runtime_cache
     if runtime_cache[path] is not None:
-        if os.getenv('YAN_JIT_DEBUG', None):
+        if os.getenv('FRAY_JIT_DEBUG', None):
             print(f'Using cached JIT runtime {name} during build')
         return runtime_cache[path]
     

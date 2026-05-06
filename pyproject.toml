@@ -7,8 +7,6 @@ name = "fray"
 dynamic = ["version"]
 description = "A JIT-based high-performance operator framework"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
 
 [tool.setuptools]
 packages = ["fray", "fray.jit", "fray.jit_kernels"]
