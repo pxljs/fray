@@ -1,76 +1,49 @@
 import os
 import sys
 import torch
-import torch.distributed as dist
 
-class empty_suppress:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        pass
-
-class suppress_stdout_stderr:
-    def __enter__(self):
-        self.outnull_file = open(os.devnull, 'w')
-        self.errnull_file = open(os.devnull, 'w')
-
-        self.old_stdout_fileno_undup = sys.stdout.fileno()
-        self.old_stderr_fileno_undup = sys.stderr.fileno()
-
-        self.old_stdout_fileno = os.dup(sys.stdout.fileno())
-        self.old_stderr_fileno = os.dup(sys.stderr.fileno())
-
-        self.old_stdout = sys.stdout
-        self.old_stderr = sys.stderr
-
-        os.dup2(self.outnull_file.fileno(), self.old_stdout_fileno_undup)
-        os.dup2(self.errnull_file.fileno(), self.old_stderr_fileno_undup)
-
-        sys.stdout = self.outnull_file
-        sys.stderr = self.errnull_file
-        return self
-
-    def __exit__(self, *_):
-        sys.stdout = self.old_stdout
-        sys.stderr = self.old_stderr
-
-        os.dup2(self.old_stdout_fileno, self.old_stdout_fileno_undup)
-        os.dup2(self.old_stderr_fileno, self.old_stderr_fileno_undup)
-
-        os.close(self.old_stdout_fileno)
-        os.close(self.old_stderr_fileno)
-
-        self.outnull_file.close()
-        self.errnull_file.close()
-
-def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
-                 trace_path: str = None, barrier_comm_profiling: bool = False, flush_l2: bool = False):
-
-    # 1. 预热
-    for _ in range(10):
+def bench_kineto(fn, kernel_names, num_tests: int = 100, flush_l2: bool = False):
+    # GPU warmup
+    warmup_gemm = torch.randn((4096, 4096), device='cuda')
+    for _ in range(5):
+        _ = warmup_gemm @ warmup_gemm
+    
+    # kernel warmup
+    for _ in range(20):
         fn()
     torch.cuda.synchronize()
 
-    # 2. 测速
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    times = []
     
-    start.record()
+    # prepare data for cache
+    if flush_l2:
+        cache_flusher = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+
     for _ in range(num_tests):
         if flush_l2:
-            _ = torch.empty(int(128e6 // 4), dtype=torch.int, device='cuda').zero_()
+            cache_flusher.zero_()
+            torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        start.record()
         fn()
-    end.record()
-    torch.cuda.synchronize()
+        end.record()
+        
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end)) # ms
+
+    # till the pre 10% due to launch expense
+    times = sorted(times)[int(num_tests * 0.1):]
+    avg_time_ms = sum(times) / len(times)
+    avg_time_us = avg_time_ms * 1000.0
     
-    # 3. 计算时间 (微秒 us)
-    avg_time_us = (start.elapsed_time(end) * 1000.0) / num_tests
-    
-    print(f"\n[Bench] {kernel_names} 耗时: {avg_time_us:.2f} us")
+    print(f"\n[Bench] {kernel_names} 真实平均耗时: {avg_time_us:.2f} us")
 
     is_tupled = isinstance(kernel_names, tuple)
-    return tuple([avg_time_us/1000] * len(kernel_names)) if is_tupled else (avg_time_us/1000)
+
+    return tuple([avg_time_ms / 1000] * len(kernel_names)) if is_tupled else (avg_time_ms / 1000) # s
 
 def calc_diff(x, y):
     x, y = x.double(), y.double()

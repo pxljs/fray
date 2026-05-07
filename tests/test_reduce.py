@@ -17,7 +17,7 @@ def test_sum_reduce():
         fray.jit_kernels.reduce_sum_max(x, y0, y1)
 
     
-    t = bench_kineto(test_func, ('SumOp<float>', 'MaxOp<float>'), suppress_kineto_output=True)
+    t = bench_kineto(test_func, ('SumOp<float>', 'MaxOp<float>'))
     for i, time in enumerate(t):
         print(f' > Performance {i}: {time * 1e6:4.0f} us')
     total_time = sum(t)

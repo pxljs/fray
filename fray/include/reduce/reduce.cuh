@@ -1,3 +1,5 @@
+#pragma once
+
 #include <cuda_fp16.h>
 #include <cassert>
 #include <cfloat>
