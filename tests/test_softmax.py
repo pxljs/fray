@@ -4,7 +4,7 @@ from fray import bench_kineto
 
 def test_softmax():
     print('\n' + "="*50)
-    print('🚀 Performance Benchmark: Custom Softmax vs PyTorch')
+    print(' Performance Benchmark: Custom Softmax vs PyTorch')
     print("="*50)
 
     B, H, S, D = 2, 12, 4096, 128 
