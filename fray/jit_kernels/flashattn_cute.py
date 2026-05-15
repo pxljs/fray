@@ -10,7 +10,7 @@ from .utils import compare_tensors
 includes = ('"flash_attn/flashattn_cute.cuh"', )
 template = """
 // Templated args from Python JIT call
-fray::flash_attn_cute<{D}>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+fray::flash_attn_cute<{R},{C},{D}>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
 """
 
 def flash_attn_cute(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, Output: torch.Tensor) -> None:
@@ -32,10 +32,13 @@ def flash_attn_cute(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, Output: t
     args = (Q, K, V, Output, batch_size, num_heads, seq_len, stream)
     runtime = jit_tuner.compile_and_tune(
         name='flash_attn_cute',
-        keys={'D': d},
-        space=(),
+        keys={'R':128, 'C':32, 'D':d},
+        space=({'R':64, 'C':32, 'D':d},
+               {'R':128, 'C':32, 'D':d},
+               {'R':64, 'C':128, 'D':d},
+               {'R':64, 'C':64, 'D':d}),
         includes=includes,
-        arg_defs=(('Q', torch.half), ('K', torch.half), ('V', torch.half), ('O', torch.half), ('batch_size', int), ('num_heads', int), ('seq_len', int), ('stream',  torch.cuda.Stream)),
+        arg_defs=(('Q', torch.half), ('K', torch.half), ('V', torch.half), ('O', torch.half), ('batch_size', int), ('num_heads', int), ('seq_len', int), ('stream', torch.cuda.Stream)),
         template=template,
         args=args
     )

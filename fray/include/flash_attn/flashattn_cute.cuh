@@ -1,17 +1,7 @@
 #pragma once
 
-#include <cute/arch/copy_sm75.hpp>
-#include <cute/arch/mma_sm80.hpp>
-#include <cute/layout.hpp>
-#include <cute/layout_composed.hpp>
-#include <cute/numeric/math.hpp>
 #include <cute/tensor.hpp>
-
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
-#include <cutlass/numeric_types.h>
-
 #include "softmax.cuh"
 
 namespace fray{
@@ -19,190 +9,172 @@ namespace fray{
 using namespace cute;
 using Element = half;
 
-template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor)
-{
-    using From_type = typename Engine::value_type;
+template <typename To, typename Engine, typename Layout>
+__device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
+    using From = typename Engine::value_type;
     constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    // HACK: this requires tensor to be "contiguous"
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    cutlass::NumericArrayConverter<To, From, numel> convert_op;
+    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From, numel> *>(tensor.data())); // frag:cutlass::Array<To, numel>
+    return make_tensor(make_rmem_ptr<To>(&frag), tensor.layout());
 }
 
-template <class Layout>
-__forceinline__ __device__ auto convert_reg_layout_c2a(Layout layout)
-{
-    using namespace cute;
+template <typename Layout>
+__device__ auto convert_reg_layout_c2a(Layout layout) {
     auto l = logical_divide(layout, Shape<X, X, _2>{});
     return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
 }
 
 template <typename ShapeT, typename CtaTiler,
-          typename SmemLayoutQ, typename SmemLayoutKV,typename SmemLayoutVt,
-          typename TiledMma0, typename TiledMma1,
-          typename TiledCopyQKV_g2s, 
-          typename TiledCopyQ_s2r,typename TiledCopyK_s2r, typename TiledCopyVt_s2r,
-          typename TiledCopyO_r2s, typename TiledCopyO_s2g>
+          typename SmemLayoutQ, typename SmemLayoutKV, typename SmemLayoutVt,
+          typename TiledMma, 
+          typename TiledCopyG2S, 
+          typename TiledCopyQ_S2R, typename TiledCopyK_S2R, typename TiledCopyVt_S2R,
+          typename TiledCopyO_R2S, typename TiledCopyO_S2G>
 __global__ void flash_attn_cute_kernel(
     Element* Q, Element* K, Element* V, Element* O,
-    float scale,
-    ShapeT tensor_shape, CtaTiler cta_tiler,
-    SmemLayoutQ sQ_layout, SmemLayoutKV sKV_layout,SmemLayoutVt sVt_layout, 
-    TiledMma0 tiled_mma0, TiledMma1 tiled_mma1,
-    TiledCopyQKV_g2s copy_g2s, 
-    TiledCopyQ_s2r copyQ_s2r, TiledCopyK_s2r copyK_s2r, TiledCopyVt_s2r copyVt_s2r,
-    TiledCopyO_r2s copyO_r2s, TiledCopyO_s2g copyO_s2g)
+    float scale, ShapeT tensor_shape, CtaTiler cta_tiler,
+    SmemLayoutQ sQ_layout, SmemLayoutKV sKV_layout, SmemLayoutVt sVt_layout, 
+    TiledMma tiled_mma,
+    TiledCopyG2S copy_g2s, 
+    TiledCopyQ_S2R copyQ_s2r, TiledCopyK_S2R copyK_s2r, TiledCopyVt_S2R copyVt_s2r,
+    TiledCopyO_R2S copyO_r2s, TiledCopyO_S2G copyO_s2g) 
 {
-    int head_idx = blockIdx.y % size<1>(tensor_shape);
-    int seq_block_idx = blockIdx.x;
-    int64_t offset = (blockIdx.y) * size<2>(tensor_shape) * size<3>(tensor_shape);
-    Element* q_ptr = Q + offset;
-    Element* k_ptr = K + offset;
-    Element* v_ptr = V + offset;
-    Element* o_ptr = O + offset; 
-
-    // Global Tensor：[seq_len, head_dim]
+    int64_t head_offset = int64_t(blockIdx.y) * size<2>(tensor_shape) * size<3>(tensor_shape);
     auto g_shape  = make_shape(size<2>(tensor_shape), size<3>(tensor_shape));
-    auto g_stride = make_stride(size<3>(tensor_shape), _1{}); // 行主序
-    Tensor mQ = make_tensor(make_gmem_ptr(q_ptr), g_shape, g_stride);
-    Tensor mK = make_tensor(make_gmem_ptr(k_ptr), g_shape, g_stride);
-    Tensor mV = make_tensor(make_gmem_ptr(v_ptr), g_shape, g_stride);
-    Tensor mO = make_tensor(make_gmem_ptr(o_ptr), g_shape, g_stride);
+    auto g_stride = make_stride(size<3>(tensor_shape), _1{});
 
-    // 切出当前 Block 负责的 Q 和 O 的 Tile: [Br, Bd]
-    auto tile_shape_QO = make_shape(size<0>(cta_tiler), size<2>(cta_tiler)); // [Br, Bd]
-    auto tile_shape_KV = make_shape(size<1>(cta_tiler), size<2>(cta_tiler)); // [Bc, Bd]
+    // Global Q/K/V/O
+    Tensor mQ = make_tensor(make_gmem_ptr(Q + head_offset), g_shape, g_stride);
+    Tensor mK = make_tensor(make_gmem_ptr(K + head_offset), g_shape, g_stride);
+    Tensor mV = make_tensor(make_gmem_ptr(V + head_offset), g_shape, g_stride);
+    Tensor mO = make_tensor(make_gmem_ptr(O + head_offset), g_shape, g_stride);
 
-    Tensor gQ = local_tile(mQ, tile_shape_QO, make_coord(seq_block_idx, 0)); 
-    Tensor gO = local_tile(mO, tile_shape_QO, make_coord(seq_block_idx, 0));
+    // Tile partition for block
+    auto tile_QO = make_shape(size<0>(cta_tiler), size<2>(cta_tiler)); // [Br, Bd]
+    auto tile_KV = make_shape(size<1>(cta_tiler), size<2>(cta_tiler)); // [Bc, Bd]
+    Tensor gQ = local_tile(mQ, tile_QO, make_coord(blockIdx.x, 0));  // [Br, Bd, Tr]
+    Tensor gO = local_tile(mO, tile_QO, make_coord(blockIdx.x, 0));  // [Br, Bd, Tr]
+    Tensor gK = local_tile(mK, tile_KV, make_coord(_, 0)); // [Bc, Bd, Tc]
+    Tensor gV = local_tile(mV, tile_KV, make_coord(_, 0)); // [Bc, Bd, Tc]
 
     // Shared Memory
     extern __shared__ char smem_raw[];
-    Element* sq_ptr = reinterpret_cast<Element*>(smem_raw);
-    Element* sk_ptr = sq_ptr + cosize(sQ_layout);
-    Element* sv_ptr = sk_ptr + cosize(sKV_layout);
-
-    Tensor sQ = make_tensor(make_smem_ptr(sq_ptr), sQ_layout);
-    Tensor sK = make_tensor(make_smem_ptr(sk_ptr), sKV_layout);
-
-    Tensor sV = make_tensor(make_smem_ptr(sv_ptr), sKV_layout);
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_raw)), sQ_layout);
+    Tensor sK = make_tensor(make_smem_ptr(sQ.data().get() + cosize(sQ_layout)), sKV_layout);
+    Tensor sV = make_tensor(make_smem_ptr(sK.data().get() + cosize(sKV_layout)), sKV_layout);
     Tensor sVt = make_tensor(sV.data(), SmemLayoutVt{}); 
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), get_nonswizzle_portion(SmemLayoutVt{}));
 
-    // Thread Partition
-    auto thr_mma0 = tiled_mma0.get_thread_slice(threadIdx.x);
-    auto thr_mma1 = tiled_mma1.get_thread_slice(threadIdx.x);
-    auto thr_copy = copy_g2s.get_thread_slice(threadIdx.x);
+    // Define thread g2s_copy_qkv
+    ThrCopy thr_g2s  = copy_g2s.get_thread_slice(threadIdx.x);
+    Tensor tQgQ = thr_g2s.partition_S(gQ);
+    Tensor tQsQ = thr_g2s.partition_D(sQ);
 
-    // Init O Accumulator (FP32)
-    Tensor tOrO = thr_mma1.partition_fragment_C(gO); // [MMA, MMA_M, MMA_K]
-    clear(tOrO);
+    Tensor tKgK = thr_g2s.partition_S(gK);
+    Tensor tKsK = thr_g2s.partition_D(sK);
 
-    // Online softmax States
-    static constexpr int kRowsPerThread = decltype(size<1>(tOrO))::value * 2;
-    OnlineSoftmax<kRowsPerThread> softmax;
-    float scale_log2 = scale * M_LOG2E; // scale * log2(e)
+    Tensor tVgV = thr_g2s.partition_S(gV);
+    Tensor tVsV = thr_g2s.partition_D(sV);
+
+    // Define thread s2r_copy k/q/v
+    ThrMMA thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+
+    ThrCopy thr_copy_q_s2r = copyQ_s2r.get_thread_slice(threadIdx.x);
+    Tensor tSsQ = thr_copy_q_s2r.partition_S(sQ);
+    Tensor tSrQ = thr_mma.partition_fragment_A(sQ); 
+    Tensor tSrQ_view = thr_copy_q_s2r.retile_D(tSrQ);
+
+    ThrCopy thr_copy_k_s2r = copyK_s2r.get_thread_slice(threadIdx.x);
+    Tensor tSsK = thr_copy_k_s2r.partition_S(sK);
+    Tensor tSrK = thr_mma.partition_fragment_B(sK);
+    Tensor tSrK_view = thr_copy_k_s2r.retile_D(tSrK);
+
+    ThrCopy thr_copy_vt_s2r = copyVt_s2r.get_thread_slice(threadIdx.x);
+    Tensor tOsVt = thr_copy_vt_s2r.partition_S(sVt);
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    Tensor tOrVt_view = thr_copy_vt_s2r.retile_D(tOrVt);
 
     // Load Q from global to shared
-    auto tQgQ = thr_copy.partition_S(gQ);
-    auto tQsQ = thr_copy.partition_D(sQ);
     copy(copy_g2s, tQgQ, tQsQ);
+    // Preload the first k tile from global to shared
+    copy(copy_g2s, tKgK(_,_,_,0), tKsK);
+
     cp_async_fence();
     cp_async_wait<0>();
     __syncthreads();
 
     // Load Q from shared to reg
-    auto thr_copy_q_s2r = copyQ_s2r.get_thread_slice(threadIdx.x);
-    auto tSsQ = thr_copy_q_s2r.partition_S(sQ);
-    auto tSrQ = thr_mma0.partition_fragment_A(sQ); 
-    auto tSrQ_view = thr_copy_q_s2r.retile_D(tSrQ);
     copy(copyQ_s2r, tSsQ, tSrQ_view);
 
+    // Init S and O Accumulator (FP32)
+    Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(cta_tiler));
+    Tensor tOrO = thr_mma.partition_fragment_C(gO); // [MMA, MMA_M, MMA_K]
+    clear(tOrO);
+
+    // Online softmax States
+    static constexpr int kRowsPerThread = decltype(size<1>(tOrO))::value * 2;
+    OnlineSoftmax<kRowsPerThread> softmax;
+    float scale_log2 = scale * 1.44269504f; // scale * log2(e)
+
+    int num_kv_tiles = ceil_div(size<2>(tensor_shape), size<1>(cta_tiler));
     // Main Loop
-    int num_k_blocks = (int(size<2>(tensor_shape)) + int(size<1>(cta_tiler)) - 1) / int(size<1>(cta_tiler));
-    for(int j = 0; j < num_k_blocks; ++j){
-        // Load K,V from global to shared
-        auto gK = local_tile(mK, tile_shape_KV, make_coord(j, 0)); // [Bc, Bd]
-        auto gV = local_tile(mV, tile_shape_KV, make_coord(j, 0)); // [Bc, Bd]
-        auto tKgK = thr_copy.partition_S(gK);
-        auto tKsK = thr_copy.partition_D(sK);
-        auto tVgV = thr_copy.partition_S(gV);
-        auto tVsV = thr_copy.partition_D(sV);
-        copy(copy_g2s, tKgK, tKsK);
-        copy(copy_g2s, tVgV, tVsV);
-        cp_async_fence();
+    for(int j = 0; j < num_kv_tiles; ++j){
+        // S = Q * K^T
         cp_async_wait<0>();
         __syncthreads();
 
-        // MMA0 : S = Q * K^T
-        auto thr_copy_k_s2r = copyK_s2r.get_thread_slice(threadIdx.x);
-        auto tSsK = thr_copy_k_s2r.partition_S(sK);
-        auto tSrK = thr_mma0.partition_fragment_B(sK);
-        auto tSrK_view = thr_copy_k_s2r.retile_D(tSrK);
-        copy(copyK_s2r, tSsK, tSrK_view);
+        copy(copy_g2s, tVgV(_, _, _, j), tVsV(_, _, _));
+        cp_async_fence();
 
-        Tensor tSrS = thr_mma0.partition_fragment_C(make_tensor<Element>(make_shape(size<0>(cta_tiler), size<1>(cta_tiler))));// [Br, Bc]
+        copy(copyK_s2r, tSsK, tSrK_view);
+        __syncthreads();
+
         clear(tSrS);
-        gemm(tiled_mma0, tSrS, tSrQ, tSrK, tSrS);
+        gemm(tiled_mma, tSrS, tSrQ, tSrK, tSrS);
+
+        cp_async_wait<0>();
+        __syncthreads();
+
+        if (j < num_kv_tiles - 1) {
+            copy(copy_g2s, tKgK(_,_,_, j+1), tKsK);
+            cp_async_fence();
+        }
 
         softmax.update(tSrS, tOrO, scale_log2);
 
-        // MMA1：O += P * V
+        // O += P * V
         Tensor rP = convert_type<Element>(tSrS);
         Tensor tOrP = make_tensor(rP.data(), convert_reg_layout_c2a(rP.layout()));
-
-        auto thr_copy_vt_s2r = copyVt_s2r.get_thread_slice(threadIdx.x);
-        auto tOsVt = thr_copy_vt_s2r.partition_S(sVt);
-        auto tOrVt = thr_mma1.partition_fragment_B(sVtNoSwizzle);
-        auto tOrVt_view = thr_copy_vt_s2r.retile_D(tOrVt);
+        
         copy(copyVt_s2r, tOsVt, tOrVt_view);
-
-        gemm(tiled_mma1, tOrO, tOrP, tOrVt, tOrO);
-        __syncthreads();
+        gemm(tiled_mma, tOrO, tOrP, tOrVt, tOrO);
     }
-
     // Normalize O
     softmax.finalize(tOrO);
 
     // Write back O
     // Write O from reg to shared
     __syncthreads();
-    Tensor sO = make_tensor(make_smem_ptr(sq_ptr), sQ_layout);
+    Tensor sO = make_tensor(sQ.data(), sQ_layout);
+    auto thr_o_r2s = copyO_r2s.get_thread_slice(threadIdx.x);
+    auto thr_o_s2g = copyO_s2g.get_thread_slice(threadIdx.x);
 
-    auto thr_copy_o_r2s =  copyO_r2s.get_thread_slice(threadIdx.x);
-    Tensor tOrO_r2s = thr_copy_o_r2s.retile_S(tOrO);
-    Tensor tOsO_r2s = thr_copy_o_r2s.partition_D(sO);
-
-    auto thr_copy_o_s2g = copyO_s2g.get_thread_slice(threadIdx.x);
-    Tensor tOsO_s2g = thr_copy_o_s2g.partition_S(sO);
-    Tensor tOgO_s2g = thr_copy_o_s2g.partition_D(gO);
-
-    Tensor tOrO_r2sx = group_modes<1, 3>(tOrO_r2s);
-    Tensor tOsO_r2sx = group_modes<1, 3>(tOsO_r2s); 
-    Tensor tOsO_s2gx = group_modes<1, 3>(tOsO_s2g); 
-    Tensor tOgO_s2gx = group_modes<1, 3>(tOgO_s2g);
-
-    CUTE_UNROLL
-    for (int i = 0; i < size<1>(tOrO_r2sx); ++i) {
-        // 创建连续的临时寄存器 t (同时隐式完成 FP32 到 FP16 的转换)
-        auto t = make_tensor_like<Element>(tOrO_r2sx(_, i));
-        copy(tOrO_r2sx(_, i), t); 
-        copy(copyO_r2s, t, tOsO_r2sx(_, i));
+    // Reg -> Smem 
+    auto tOrO_r2s = group_modes<1, 3>(thr_o_r2s.retile_S(tOrO));
+    auto tOsO_r2s = group_modes<1, 3>(thr_o_r2s.partition_D(sO));
+    for (int i = 0; i < size<1>(tOrO_r2s); ++i) {
+        auto t_reg = make_tensor_like<Element>(tOrO_r2s(_, i));
+        copy(tOrO_r2s(_, i), t_reg);
+        copy(copyO_r2s, t_reg, tOsO_r2s(_, i));
     }
-    
-    // 关键同步：必须等所有线程把 O 全部写进 Smem
+
     __syncthreads();
-
-    // 将 O 从共享内存利用 128-bit 向量化合并写入全局内存 (Smem -> Gmem)
-    CUTE_UNROLL
-    for (int i = 0; i < size<1>(tOsO_s2gx); ++i) {
-        copy(copyO_s2g, tOsO_s2gx(_, i), tOgO_s2gx(_, i));
-    }
+    // Smem -> Global
+    copy(copyO_s2g, thr_o_s2g.partition_S(sO), thr_o_s2g.partition_D(gO));
 }
 
 
-template <int HEAD_DIM = 128>
+template <int R = 128, int C = 32,int D = 128>
 void flash_attn_cute(Element* query, Element* key, Element* value, half *output, int batch_size, int num_heads, int seq_len, cudaStream_t stream)
 {
     // 先假设QKV对应的的序列长度一样，均为sep_len
@@ -211,12 +183,12 @@ void flash_attn_cute(Element* query, Element* key, Element* value, half *output,
     // query: [batch_size, num_heads, seq_len, head_dim]
     // output: [batch_size, num_heads, seq_len, head_dim]
     // scores/weights: [batch_size, num_heads, seq_len, seq_len] , weights = softmax(scores)
+    auto Br = Int<R>{};
+    auto Bc = Int<C>{};
+    auto Bd = Int<D>{};
 
-    auto tensor_shape = make_shape(batch_size, num_heads, seq_len, Int<HEAD_DIM>{});
-    // 每个block负责计算最终结果[Br, HEAD_DIM] = [128, 128]的输出
-    auto Br = Int<128>{};
-    auto Bc = Int<32>{};
-    auto Bd = Int<HEAD_DIM>{};
+    auto tensor_shape = make_shape(batch_size, num_heads, seq_len, Bd);
+    // 每个block负责计算最终结果[Br, Bd] = [128, 128]的输出
     auto cta_tiler = make_shape(Br, Bc, Bd);
 
     // Define Layouts
@@ -231,61 +203,50 @@ void flash_attn_cute(Element* query, Element* key, Element* value, half *output,
 
     // Define MMA
     using MMA_Atom = SM80_16x8x16_F32F16F16F32_TN;
-    // MMA0: 用于计算 S = Q * K^T. 
-    // Q 尺寸为 [128, 128], K 尺寸为 [32, 128], 输出 S 为 [128, 32]
-    TiledMMA tiled_mma0 = make_tiled_mma(MMA_Atom{},
-                                         Layout<Shape<_4, _1, _1>>{},  // 128 线程: 4 warps in M, 1 warp in N
-                                         Tile<_128, _32, _16>{});      // Tile 覆盖整个 S 矩阵的分块大小
-
-    // MMA1: 用于计算 O = P * V. 
-    // P 尺寸为 [128, 32], V 尺寸为 [32, 128], 输出 O 为 [128, 128]
-    TiledMMA tiled_mma1 = make_tiled_mma(MMA_Atom{},
+    TiledMMA tiled_mma = make_tiled_mma(MMA_Atom{},
                                          Layout<Shape<_4, _1, _1>>{},
-                                         Tile<_128, _128, _32>{});     // Tile 覆盖整个 O 矩阵的分块大小
+                                         Tile<_64, _16, _16>{});
 
     // Define Copies
     // Global To Shared
-    TiledCopy copyQKV_g2s = make_tiled_copy(
-        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, Element>{},
-        Layout<Shape<_16, _8>, Stride<_8, _1>>{}, // 16x8 = 128 线程
-        Layout<Shape<_1, _8>>{});                 // 每个线程搬 8 个元素
-    // Shared To Reg
-    TiledCopy copyQ_s2r = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, Element>{}, tiled_mma0);
-    TiledCopy copyK_s2r = make_tiled_copy_B(Copy_Atom<SM75_U32x4_LDSM_N, Element>{}, tiled_mma0);
-    TiledCopy copyVt_s2r = make_tiled_copy_B(Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, tiled_mma1);
+    auto g2s_copy = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, Element>{},
+                                    Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+    
+    auto s2r_copy_Q = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, Element>{}, tiled_mma);
+    auto s2r_copy_K = make_tiled_copy_B(Copy_Atom<SM75_U32x4_LDSM_N, Element>{}, tiled_mma);
+    auto s2r_copy_V = make_tiled_copy_B(Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, tiled_mma);
 
-    TiledCopy copyO_r2s = make_tiled_copy_C(Copy_Atom<UniversalCopy<int>, Element>{}, tiled_mma1);
-    TiledCopy copyO_s2g = make_tiled_copy(
+    TiledCopy r2s_copy_O = make_tiled_copy_C(Copy_Atom<UniversalCopy<int>, Element>{}, tiled_mma);
+    TiledCopy s2g_copy_O = make_tiled_copy(
         Copy_Atom<UniversalCopy<uint128_t>, Element>{}, 
         Layout<Shape<_16, _8>, Stride<_8, _1>>{}, 
         Layout<Shape<_1, _8>>{});
 
     int seq_blocks = (seq_len + Br - 1) / Br;    
-    float scale = 1.0f / sqrt((float)HEAD_DIM); 
+    float scale = 1.0f / sqrt((float)Bd); 
 
     // Grid.x 负责序列长度分块, Grid.y 负责 Batch 和 Heads                            
     dim3 dimGrid(seq_blocks, batch_size * num_heads);
-    dim3 dimBlock(int(size(tiled_mma0))); // 128 线程
+    dim3 dimBlock(int(size(tiled_mma))); // 128 线程
 
     static constexpr int smem_size = (cosize(sQ_layout) + cosize(sKV_layout) * 2) * sizeof(Element);
 
     auto kernel = flash_attn_cute_kernel<
         decltype(tensor_shape), decltype(cta_tiler), 
         decltype(sQ_layout), decltype(sKV_layout), decltype(sVt_layout),
-        decltype(tiled_mma0), decltype(tiled_mma1),
-        decltype(copyQKV_g2s), decltype(copyQ_s2r), 
-        decltype(copyK_s2r), decltype(copyVt_s2r),
-        decltype(copyO_r2s), decltype(copyO_s2g)>;
+        decltype(tiled_mma), 
+        decltype(g2s_copy), decltype(s2r_copy_Q), 
+        decltype(s2r_copy_K), decltype(s2r_copy_V),
+        decltype(r2s_copy_O), decltype(s2g_copy_O)>;
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
     kernel<<<dimGrid, dimBlock, smem_size, stream>>>(
         query, key, value, output,
         scale, tensor_shape, cta_tiler,
         sQ_layout, sKV_layout, sVt_layout,
-        tiled_mma0, tiled_mma1,
-        copyQKV_g2s, copyQ_s2r, copyK_s2r, copyVt_s2r,
-        copyO_r2s, copyO_s2g);
+        tiled_mma, 
+        g2s_copy, s2r_copy_Q, s2r_copy_K, s2r_copy_V,
+        r2s_copy_O, s2g_copy_O);
 }
 
 } // namespace fray

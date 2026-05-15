@@ -38,11 +38,10 @@ def test_flash_attn():
     print(' Performance Benchmark: Fray Flash Attention vs PyTorch (SDPA)')
     print("="*50)
 
-    head_dim = 128
-    batch_size = 16  # 显存不够可以调小为 8
+    batch_size = 8
 
     for seq_len in (1024, 2048, 4096):
-        for num_heads in (12, 16, 24):
+        for num_heads, head_dim in [(16, 64), (64, 128)]:
             print(f"\nConfiguration: B={batch_size}, N={seq_len}, H={num_heads}, D={head_dim}")
             
             # 1. 准备数据 (全部保持 [B, H, N, D])
