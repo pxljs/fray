@@ -5,7 +5,7 @@
 namespace fray {
 
 // 存储 Max 和 Sum 的结构体，对齐以优化寄存器传递
-struct __align__(8) MD {
+struct alignas(8) MD {
     float m;
     float d;
 };

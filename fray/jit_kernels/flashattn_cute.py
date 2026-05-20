@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 
 from .tuner import jit_tuner
-from .utils import compare_tensors
 
 includes = ('"flash_attn/flashattn_cute.cuh"', )
 template = """

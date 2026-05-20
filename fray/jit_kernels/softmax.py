@@ -44,7 +44,7 @@ def accuracy_test():
     B, H, S, D = 2, 12, 4096, 128 
     
     print("\n" + "="*50)
-    print(" 🧪 Test 1: 连续内存张量 (Contiguous Tensor)")
+    print(" Test 1: 连续内存张量 (Contiguous Tensor)")
     print("="*50)
     # x 是内存连续的
     x = torch.randn(B, H, S, D, dtype=torch.float, device='cuda')
@@ -66,7 +66,7 @@ def accuracy_test():
 
 
     print("="*50)
-    print(" 🧪 Test 2: 非连续内存张量 (Transposed / Non-Contiguous Tensor)")
+    print(" Test 2: 非连续内存张量 (Transposed / Non-Contiguous Tensor)")
     print("="*50)
     # 在大模型注意力机制中，经常发生 seq_len 和 heads 的维度交换
     # 这里的 x_trans 物理内存是不连续的，它的 stride_h 和 stride_s 被打乱了

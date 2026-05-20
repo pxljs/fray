@@ -3,26 +3,13 @@
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_conversion.h>
 #include "softmax.cuh"
+#include "utils.cuh"
 
 namespace fray{
 
 using namespace cute;
+using namespace fray::utils;
 using Element = half;
-
-template <typename To, typename Engine, typename Layout>
-__device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To, From, numel> convert_op;
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From, numel> *>(tensor.data())); // frag:cutlass::Array<To, numel>
-    return make_tensor(make_rmem_ptr<To>(&frag), tensor.layout());
-}
-
-template <typename Layout>
-__device__ auto convert_reg_layout_c2a(Layout layout) {
-    auto l = logical_divide(layout, Shape<X, X, _2>{});
-    return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-}
 
 template <typename ShapeT, typename CtaTiler,
           typename SmemLayoutQ, typename SmemLayoutKV, typename SmemLayoutVt,
@@ -118,6 +105,7 @@ __global__ void flash_attn_cute_kernel(
 
     int num_kv_tiles = ceil_div(size<2>(tensor_shape), size<1>(cta_tiler));
     // Main Loop
+    CUTE_NO_UNROLL
     for(int j = 0; j < num_kv_tiles; ++j){
         // S = Q * K^T
         cp_async_wait<0>();
@@ -162,6 +150,7 @@ __global__ void flash_attn_cute_kernel(
     // Reg -> Smem 
     auto tOrO_r2s = group_modes<1, 3>(thr_o_r2s.retile_S(tOrO));
     auto tOsO_r2s = group_modes<1, 3>(thr_o_r2s.partition_D(sO));
+    CUTE_UNROLL
     for (int i = 0; i < size<1>(tOrO_r2s); ++i) {
         auto t_reg = make_tensor_like<Element>(tOrO_r2s(_, i));
         copy(tOrO_r2s(_, i), t_reg);

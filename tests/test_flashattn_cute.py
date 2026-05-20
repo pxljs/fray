@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import fray
 from fray import bench_kineto
@@ -61,7 +62,9 @@ def test_flash_attn():
 
             def run_pytorch():
                 # 强制 PyTorch 尝试使用底层的 FlashAttention 后端
-                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                #     return F.scaled_dot_product_attention(q, k, v, is_causal=False)
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     return F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
             # 4. 执行 Kineto 测速
