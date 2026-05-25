@@ -12,6 +12,7 @@ IS_WINDOWS = platform.system() == "Windows"
 typename_map: Dict[Any, str] = {
     **{t: t.__name__ for t in (bool, int, float)},
     torch.int: "torch.int",
+    torch.uint8: "torch.uint8",
     torch.float: "torch.float",
     torch.float16: "torch.half",
     torch.bfloat16: "torch.bfloat16",
@@ -26,6 +27,7 @@ ctype_map: Dict[Any, Any] = {
         t: ctypes.c_void_p
         for t in (
             torch.int,
+            torch.uint8,
             torch.float,
             torch.half,
             torch.bfloat16,
@@ -41,6 +43,7 @@ genc_map = {
     int: ("int", "int"),
     float: ("float", "float"),
     torch.int: ("void*", "int*"),
+    torch.uint8: ("void*", "uint8_t*"),
     torch.float: ("void*", "float*"),
     torch.half: ("void*", "__half*"),
     torch.bfloat16: ("void*", "__nv_bfloat16*"),
@@ -91,6 +94,7 @@ def generate(includes: Iterable[str], arg_defs: Iterable[Tuple], body: str) -> s
 
     # Includes
     preload_sys_includes = [
+        "<cstdint>",
         "<cuda.h>",
         "<cuda_fp8.h>",
         "<cuda_runtime.h>",

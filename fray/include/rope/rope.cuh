@@ -9,7 +9,6 @@ namespace fray {
 
 union alignas(16) Float4Pack {
     uint4 u4;
-    half2 h2[4];
     half  h[8];
 };
 
@@ -83,7 +82,6 @@ __global__ void fused_rope_kernel(
             float cos_val = c_ptr[k];
             float sin_val = s_ptr[k];
 
-            // 核心数学公式：旋转变换
             // x_i_new = x_i * cos - x_j * sin
             // x_j_new = x_i * sin + x_j * cos
             res_first.h[k]  = __float2half(x_i * cos_val - x_j * sin_val);
@@ -99,9 +97,10 @@ __global__ void fused_rope_kernel(
     }
 }
 
+template <int HEAD_DIM>
 void fused_rope(half* Q, half* K, const float* cos_table, const float* sin_table,
                 const int* cache_offsets, int num_tokens, int num_heads, 
-                int num_kv_heads, int head_dim, cudaStream_t stream) 
+                int num_kv_heads, cudaStream_t stream) 
 {
     // 每个 Head 分配 1 个 Warp (32 线程) 是最平衡的
     // 对于 head_dim=128，每个线程实际只需处理 128/2/32 = 2 个对
@@ -109,12 +108,9 @@ void fused_rope(half* Q, half* K, const float* cos_table, const float* sin_table
     // Grid.y 负责 Token，Grid.x 负责所有的 Head (Q + K)
     dim3 grid(num_heads + num_kv_heads, num_tokens);
 
-    // 根据 head_dim 派发模板（优化：可以处理任意 head_dim，这里以 128 为例）
-    if (head_dim == 128) {
-        fused_rope_kernel<128><<<grid, block, 0, stream>>>(
+    fused_rope_kernel<HEAD_DIM><<<grid, block, 0, stream>>>(
             Q, K, cos_table, sin_table, cache_offsets, 
             num_heads, num_kv_heads, num_heads * 128, num_kv_heads * 128);
-    }
 }
 
 } // namespace fray

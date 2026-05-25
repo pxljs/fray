@@ -1,6 +1,7 @@
 import copy
 import os
 import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict
 
 from ..jit import build, cpp_format, generate, Runtime
@@ -28,15 +29,28 @@ class JITTuner:
         assert args is not None
         space = (dict(), ) if len(space) == 0 else space
 
-        kernels = []
+        # Phase 1: Generate code for all configs
+        code_specs = []
         for tuned_keys in space:
             assert isinstance(tuned_keys, dict)
             full_keys = copy.deepcopy(keys)
             full_keys.update(tuned_keys)
             code = generate(includes, arg_defs, cpp_format(template, full_keys))
+            code_specs.append((code, tuned_keys))
 
-            # Illegal build must raise errors
-            kernels.append((build(name, arg_defs, code), tuned_keys))
+        # Phase 2: Compile in parallel (NVCC subprocess releases GIL)
+        max_workers = min(len(code_specs), os.cpu_count() or 4)
+        if max_workers > 1 and len(code_specs) > 1:
+            kernels = []
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(build, name, arg_defs, code): tuned_keys
+                           for code, tuned_keys in code_specs}
+                for f in as_completed(futures):
+                    runtime = f.result()  # Propagates build errors
+                    kernels.append((runtime, futures[f]))
+        else:
+            kernels = [(build(name, arg_defs, code), tuned_keys)
+                      for code, tuned_keys in code_specs]
 
         best_runtime, best_time, best_keys = None, None, None
         for runtime, tuned_keys in kernels:

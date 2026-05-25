@@ -39,7 +39,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 100, flush_l2: bool = False)
     avg_time_ms = sum(times) / len(times)
     avg_time_us = avg_time_ms * 1000.0
     
-    print(f"\n[Bench] {kernel_names} 真实平均耗时: {avg_time_us:.2f} us")
+    print(f"\n[Bench] {kernel_names} 平均耗时: {avg_time_us:.2f} us")
 
     is_tupled = isinstance(kernel_names, tuple)
 

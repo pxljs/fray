@@ -4,4 +4,6 @@ from .online_softmax import online_softmax, accuracy_test as online_softmax_accu
 from .fp16_gemm import fp16_gemm, accuracy_test as fp16_gemm_accuracy_test
 from .flashattn_cute import flash_attn_cute
 from .rmsnorm import fused_rmsnorm
+from .rope import fused_rope
+from .flash_decoding import flash_decoding
 from .utils import get_col_major_tensor

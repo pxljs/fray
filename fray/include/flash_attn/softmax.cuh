@@ -3,7 +3,9 @@
 #include <cmath>
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>
+
 #include "utils.cuh"
+#include "reduce_utils.cuh"
 
 namespace fray{
     
@@ -36,7 +38,7 @@ struct OnlineSoftmax{
 
         CUTE_UNROLL
         for(int r = 0; r < kNumRows; ++r){
-            cur_max(r) = warp_reduce<4>(cur_max(r), MaxOp{});
+            cur_max(r) = warp_reduce<4>(cur_max(r), MaxOp<float>{});
         }
 
         CUTE_UNROLL
@@ -62,7 +64,7 @@ struct OnlineSoftmax{
                 l_sum += scores(r, c);
             }
 
-            row_sum(r) += warp_reduce<4>(l_sum, SumOp{});
+            row_sum(r) += warp_reduce<4>(l_sum, SumOp<float>{});
         }
     }
 
