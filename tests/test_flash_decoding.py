@@ -1,7 +1,5 @@
-import pytest
 import torch
 import torch.nn.functional as F
-import math
 
 import fray
 from fray import bench_kineto

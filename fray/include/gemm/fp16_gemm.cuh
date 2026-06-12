@@ -231,7 +231,7 @@ void fp16_gemm_c(int M, int N, int K,
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
     kernel<<<dimGrid, dimBlock, smem_size, stream>>>(
-        prob_shape, cta_tiler, 
+        MNK_shape, cta_tiler, 
         A, sA_layout, copy_a_g2s, copy_a_s2r,
         B, sB_layout, copy_b_g2s, copy_b_s2r,
         C, sC_layout, copy_c_s2g, copy_c_r2s,

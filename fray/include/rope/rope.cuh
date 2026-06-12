@@ -113,4 +113,5 @@ void fused_rope(half* Q, half* K, const float* cos_table, const float* sin_table
             num_heads, num_kv_heads, num_heads * 128, num_kv_heads * 128);
 }
 
+
 } // namespace fray
