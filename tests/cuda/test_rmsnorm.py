@@ -60,7 +60,7 @@ def performance_test():
     epsilon = 1e-5
     
     # 模拟常见大模型的推理/训练维度 (LLaMA-3-8B 的 hidden_dim 是 4096)
-    for num_tokens in (1, 2048, 8192):
+    for num_tokens in (1, 2048, 4096, 8192):
         for hidden_dim in (4096, 8192):
             print(f"\nConfiguration: Tokens = {num_tokens:<4}, Hidden_Dim = {hidden_dim:<4}")
             

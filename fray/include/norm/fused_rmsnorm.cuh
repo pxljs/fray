@@ -13,7 +13,7 @@ using namespace fray::utils;
 union alignas(16) Float4Pack {
     uint4 u4;
     half2 h2[4];
-};6
+};
 
 template <int VECS_PER_THREAD>
 __global__ void fused_rmsnorm_kernel(
