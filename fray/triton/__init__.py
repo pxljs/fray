@@ -4,3 +4,4 @@ from .rmsnorm import rmsnorm
 from .softmax import softmax
 from .matmul import matmul
 from .grouped_gemm import grouped_gemm, build_grouped_gemm_metadata
+from .fused_moe import fused_moe
