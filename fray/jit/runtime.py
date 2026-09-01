@@ -4,7 +4,7 @@ import platform
 import torch
 from typing import Optional
 
-from .template import map_ctype
+from .template import deserialize_arg_defs, map_ctype
 
 # Detect Windows platform
 IS_WINDOWS = platform.system() == "Windows"
@@ -45,22 +45,22 @@ class Runtime:
                 self.lib = ctypes.CDLL(lib_name)
 
             with open(os.path.join(self.path, "kernel.args"), "r") as f:
-                self.args = eval(f.read())
+                self.args = deserialize_arg_defs(f.read())
 
-        assert len(args) == len(
-            self.args
-        ), f"Expected {len(self.args)} arguments, got {len(args)}"
+        assert len(args) == len(self.args), (
+            f"Expected {len(self.args)} arguments, got {len(args)}"
+        )
 
         cargs = []
         for arg, (name, dtype) in zip(args, self.args):
             if isinstance(arg, torch.Tensor):
-                assert (
-                    arg.dtype == dtype
-                ), f"Expected tensor dtype `{dtype}` for `{name}`, got `{arg.dtype}`"
+                assert arg.dtype == dtype, (
+                    f"Expected tensor dtype `{dtype}` for `{name}`, got `{arg.dtype}`"
+                )
             else:
-                assert isinstance(
-                    arg, dtype
-                ), f"Expected built-in type `{dtype}` for `{name}`, got `{type(arg)}`"
+                assert isinstance(arg, dtype), (
+                    f"Expected built-in type `{dtype}` for `{name}`, got `{type(arg)}`"
+                )
             cargs.append(map_ctype(arg))
 
         return_code = ctypes.c_int(0)

@@ -1,235 +1,250 @@
-⚡ Fray
-========
-A JIT-based High-Performance Operator Framework for Deep Learning
+# Fray
 
-📖 Overview
------------
+A playground and toolkit for writing high-performance deep learning operators
+with CUDA/CuTe JIT kernels and Triton kernels.
 
-Fray is a Just-In-Time (JIT) compiled, high-performance CUDA operator framework designed for
-modern Deep Learning systems. Built on top of NVIDIA's **CuTe** (the core algebraic layout engine
-of CUTLASS 3.x) and integrated seamlessly with PyTorch's C++ Extension JIT compiler, Fray provides
-a dynamic, auto-tunable, and zero-overhead execution environment for heavily optimized GPU kernels.
+Fray is focused on the parts of GPU programming that matter when building modern
+LLM inference kernels: explicit memory movement, tiled GEMM, online reductions,
+attention variants, routing, grouped GEMM, and fused MoE execution. The project
+contains two complementary implementation paths:
 
-Fray bridges the gap between high-level Python models and low-level hardware micro-architecture,
-allowing for dynamic shape tuning, aggressive register reuse, and instruction-level latency hiding
-on NVIDIA Ampere (SM80) and later architectures.
+- `fray.jit_kernels`: CUDA/CuTe kernels compiled just in time and cached.
+- `fray.triton`: Triton kernels for fast iteration and end-to-end operator
+  prototyping.
 
-🏗 Architecture
----------------
+## Highlights
 
-```
-Python DSL (Fray Kernels)
-    │
-    ├── JIT Compiler ──── Generates CUDA code from C++ templates
-    │       │
-    │       ├── CuTe (CUTLASS Algebraic Layout Engine)
-    │       ├── CUTLASS (Tiled MMA, Copy, Epilogue)
-    │       └── Fray Headers (Custom kernel implementations)
-    │
-    ├── Auto-Tuner ────── Compiles & profiles multiple tile configurations
-    │       │
-    │       ├── L2 cache flush between runs
-    │       ├── Iterative profiling (20 warmup runs)
-    │       └── Best config caching (persisted to disk)
-    │
-    └── Runtime ────────── Dynamically loads compiled .so/.dll via ctypes
-```
+- JIT-compiled CUDA/CuTe kernels with content-hash based caching.
+- Triton implementations for common operators and MoE workflows.
+- Auto-tuning support for CUDA JIT kernels.
+- Focused tests and benchmarks under `tests/cuda` and `tests/triton`.
+- Reference-oriented third-party sources under `third-party`.
 
-The framework follows a three-stage pipeline:
+## Supported Operators
 
-1. **Compile** — Python kernel definitions are instantiated as C++ templates with concrete tile
-   sizes, compiled on-the-fly via NVCC (≥12.3), and cached to disk for reuse across sessions.
-2. **Tune** — Multiple tile configurations are benchmarked with L2 cache flushing to find the
-   optimal block sizes for the current GPU architecture.
-3. **Invoke** — The best kernel is loaded as a shared library and called directly from Python
-   with zero framework overhead.
+| Area | API | Backend | Notes |
+| --- | --- | --- | --- |
+| Vector add | `fray.triton.vector_add` | Triton | Minimal Triton example |
+| Matmul | `fray.triton.matmul` | Triton | FP16/BF16 style tiled matmul |
+| Grouped GEMM | `fray.triton.grouped_gemm` | Triton | Metadata-driven grouped GEMM |
+| RMSNorm | `fray.triton.rmsnorm`, `fray.triton.add_rmsnorm`, `fray.jit_kernels.fused_rmsnorm` | Triton, CUDA/CuTe | Normalization kernels |
+| RoPE | `fray.triton.rope`, `fray.jit_kernels.fused_rope` | Triton, CUDA/CuTe | GPT-NeoX style rotary embedding |
+| SiLU and multiply | `fray.triton.silu_mul` | Triton | MoE activation helper |
+| GELU and multiply | `fray.triton.gelu_mul` | Triton | GeGLU activation helper |
+| Softmax | `fray.triton.softmax`, `fray.jit_kernels.softmax` | Triton, CUDA/CuTe | Dense softmax kernels |
+| Online softmax | `fray.jit_kernels.online_softmax` | CUDA/CuTe | Streaming softmax reduction |
+| FP16 GEMM | `fray.jit_kernels.fp16_gemm` | CUDA/CuTe | Tiled GEMM |
+| Flash decoding | `fray.jit_kernels.flash_decoding` | CUDA/CuTe | Decode attention path |
+| Flash MLA | `fray.jit_kernels.flash_mla` | CUDA/CuTe | MLA-oriented attention kernel |
+| FlashAttention | `fray.jit_kernels.flash_attn_cute` | CUDA/CuTe | CuTe-native attention experiment |
+| Fused MoE | `fray.triton.fused_moe` | Triton | Routing, dispatch metadata, two GEMMs, combine |
 
-✨ Key Features
----------------
+## Installation
 
-- **JIT Compilation with Caching** — Kernels are compiled on first use and cached by content hash.
-  Subsequent runs skip compilation entirely.
-- **Auto-Tuning** — Each kernel explores a configurable search space of tile sizes, automatically
-  selecting the fastest variant for the current GPU.
-- **CuTe-Native** — All kernels are built directly on CuTe primitives (TiledCopy, TiledMMA,
-  Swizzle layouts), bypassing CUTLASS composition layers for maximum control over the
-  instruction stream.
-- **FFMA Interleave SASS Optimization** — Post-compilation FFMA (Fused Floating-point
-  Multiply-Add) instruction interleaving to hide instruction latency on SM80/SM89/SM90.
-- **Non-Contiguous Tensor Support** — CuTe's algebraic layout system enables kernels to handle
-  arbitrary strided tensors without intermediate copies.
-- **Cross-Platform** — Supports both Linux and Windows with automatic NVCC detection.
-
-📦 Supported Kernels
---------------------
-
-| Kernel | Precision | Description |
-|--------|-----------|-------------|
-| `flashattn_cute` | FP16 | Flash Attention with online softmax fusion, CuTe-native implementation |
-| `fp16_gemm` | FP16 → FP32 accumulate | Tiled GEMM with asynchronous shared memory pipelining |
-| `online_softmax` | FP32 | Numerically stable online softmax with vectorized float4 loads |
-| `softmax` | FP32 | Multi-dimensional softmax supporting arbitrary strided layouts |
-| `reduce_sum_max` | FP32 | Fused sum + max reduction with float4 vectorized access |
-
-🚀 Quick Start
---------------
-
-### Prerequisites
-
-- CUDA Toolkit ≥ 12.3
-- PyTorch ≥ 2.0 with CUDA support
-- NVIDIA GPU with compute capability ≥ SM80 (Ampere, Ada, Hopper)
-
-### Installation
+Fray requires Python 3.12+, PyTorch with CUDA, Triton, and a CUDA toolchain for
+the CUDA/CuTe JIT kernels.
 
 ```bash
 pip install -e .
 ```
 
-### Usage
+For development dependencies:
+
+```bash
+pip install -e ".[test,bench,dev]"
+```
+
+The project also includes `uv.lock`, so `uv` can be used if you prefer a locked
+environment workflow.
+
+## Quick Start
+
+### Triton Matmul
+
+```python
+import torch
+from fray.triton import matmul
+
+m, n, k = 4096, 4096, 4096
+a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+
+out = matmul(a, b)
+```
+
+### Triton Fused MoE
+
+```python
+import torch
+from fray.triton import fused_moe
+
+num_tokens = 4096
+num_experts = 64
+hidden_size = 4096
+intermediate_size = 14336
+top_k = 2
+
+x = torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.float16)
+router_logits = torch.randn(
+    (num_tokens, num_experts), device="cuda", dtype=torch.float32
+)
+w13 = torch.randn(
+    (num_experts, hidden_size, 2 * intermediate_size),
+    device="cuda",
+    dtype=torch.float16,
+)
+w2 = torch.randn(
+    (num_experts, intermediate_size, hidden_size),
+    device="cuda",
+    dtype=torch.float16,
+)
+
+out = fused_moe(x, router_logits, w13, w2, top_k=top_k)
+```
+
+### CUDA/CuTe JIT GEMM
 
 ```python
 import torch
 import fray
 
-# FP16 GEMM — C = A × Bᵀ
-M, N, K = 4096, 4096, 4096
-a = torch.randn(M, K, dtype=torch.half, device='cuda')
-b = torch.randn(N, K, dtype=torch.half, device='cuda')
-c = torch.zeros(M, N, dtype=torch.half, device='cuda')
+m, n, k = 4096, 4096, 4096
+a = torch.randn((m, k), dtype=torch.float16, device="cuda")
+b = torch.randn((n, k), dtype=torch.float16, device="cuda")
+c = torch.empty((m, n), dtype=torch.float16, device="cuda")
+
 fray.jit_kernels.fp16_gemm(a, b, c)
-
-# Flash Attention
-B, H, S, D = 2, 16, 2048, 128
-q = torch.randn(B, H, S, D, dtype=torch.half, device='cuda')
-k = torch.randn(B, H, S, D, dtype=torch.half, device='cuda')
-v = torch.randn(B, H, S, D, dtype=torch.half, device='cuda')
-out = torch.zeros_like(q)
-fray.jit_kernels.flash_attn_cute(q, k, v, out)
-
-# Online Softmax (FP32)
-x = torch.randn(16384, 512, dtype=torch.float, device='cuda')
-y = torch.empty_like(x)
-fray.jit_kernels.online_softmax(x, y)
-
-# Fused Reduce (Sum + Max)
-x = torch.randn(4096 * 1024, dtype=torch.float, device='cuda')
-y_sum = torch.zeros(1, dtype=torch.float, device='cuda')
-y_max = torch.full((1,), float('-inf'), dtype=torch.float, device='cuda')
-fray.jit_kernels.reduce_sum_max(x, y_sum, y_max)
 ```
 
-### Running Tests
+## Tests
+
+CUDA/CuTe JIT tests:
 
 ```bash
-python tests/test_fp16_gemm.py
-python tests/test_flashattn_cute.py
-python tests/test_online_softmax.py
-python tests/test_softmax.py
-python tests/test_reduce.py
+pytest tests/cuda
 ```
 
-### Running Benchmarks
+Triton tests:
+
+```bash
+pytest tests/triton
+```
+
+Run a focused MoE test or benchmark:
+
+```bash
+pytest tests/triton/test_fused_moe.py
+```
+
+Some tests require a CUDA GPU and may compile kernels on first run.
+
+## Benchmarking
+
+Use `fray.bench_kineto` for timing small callables:
 
 ```python
 from fray import bench_kineto
-import fray
 
-def my_kernel():
-    fray.jit_kernels.fp16_gemm(a, b, c)
-
-avg_time_s = bench_kineto(my_kernel, 'fray_cute_gemm')
-print(f"Average time: {avg_time_s * 1e6:.2f} us")
+avg_time_s = bench_kineto(lambda: fused_moe(x, router_logits, w13, w2, top_k=2),
+                          "fused_moe")
+print(f"{avg_time_s * 1e6:.2f} us")
 ```
 
-🔧 Configuration
-----------------
+The fused MoE tests include prepared and end-to-end benchmark paths. Prepared
+benchmarks measure the core compute path with dispatch metadata supplied.
+End-to-end benchmarks include routing and dispatch metadata construction.
 
-| Environment Variable | Description |
-|----------------------|-------------|
-| `FRAY_CACHE_DIR` | Override the default cache directory (`~/.cache/fray`) |
-| `FRAY_NVCC_COMPILER` | Path to a specific NVCC binary |
-| `FRAY_JIT_DEBUG` | Print generated CUDA code and compilation commands |
-| `FRAY_PRINT_AUTOTUNE` | Print auto-tuning results |
-| `FRAY_PTXAS_VERBOSE` | Enable PTX assembler verbose output (register usage) |
-| `FRAY_DISABLE_FFMA_INTERLEAVE` | Disable FFMA interleaving SASS optimization |
+## Configuration
 
-📁 Project Structure
---------------------
+| Environment variable | Description |
+| --- | --- |
+| `FRAY_CACHE_DIR` | Override the CUDA JIT cache directory. |
+| `FRAY_NVCC_COMPILER` | Select a specific `nvcc` binary. |
+| `FRAY_JIT_DEBUG` | Print generated CUDA code and build commands. |
+| `FRAYJIT_PRINT_NVCC_COMMAND` | Print only the NVCC build command. |
+| `FRAY_JIT_MAX_WORKERS` | Limit parallel NVCC compilations during tuning. |
+| `FRAY_PRINT_AUTOTUNE` | Print auto-tuning results. |
+| `FRAY_PTXAS_VERBOSE` | Enable ptxas verbose output. |
+| `FRAY_DISABLE_FFMA_INTERLEAVE` | Disable FFMA interleaving optimization. |
 
-```
+## Project Structure
+
+```text
 fray/
 ├── fray/
 │   ├── __init__.py
-│   ├── utils.py                  # bench_kineto, calc_diff utilities
+│   ├── _version.py
+│   ├── utils.py
 │   ├── jit/
-│   │   ├── __init__.py
-│   │   ├── compiler.py           # NVCC detection, JIT build pipeline
-│   │   ├── runtime.py            # ctypes-based dynamic library loader
-│   │   ├── template.py           # C++ code generation from templates
-│   │   └── interleave_ffma.py    # SASS-level FFMA interleaving optimizer
+│   │   ├── compiler.py
+│   │   ├── runtime.py
+│   │   ├── template.py
+│   │   └── interleave_ffma.py
 │   ├── jit_kernels/
-│   │   ├── __init__.py
-│   │   ├── tuner.py              # Auto-tuner with profiling & caching
-│   │   ├── flashattn_cute.py     # Flash Attention kernel definition
-│   │   ├── fp16_gemm.py          # FP16 GEMM kernel definition
-│   │   ├── online_softmax.py     # Online Softmax kernel definition
-│   │   ├── softmax.py            # Multi-dimensional Softmax kernel definition
-│   │   └── reduce.py             # Fused Reduce kernel definition
+│   │   ├── flash_decoding.py
+│   │   ├── flash_mla.py
+│   │   ├── flashattn_cute.py
+│   │   ├── fp16_gemm.py
+│   │   ├── online_softmax.py
+│   │   ├── reduce.py
+│   │   ├── rmsnorm.py
+│   │   ├── rope.py
+│   │   ├── softmax.py
+│   │   └── tuner.py
+│   ├── triton/
+│   │   ├── fused_moe.py
+│   │   ├── gelu_mul.py
+│   │   ├── grouped_gemm.py
+│   │   ├── matmul.py
+│   │   ├── rmsnorm.py
+│   │   ├── rope.py
+│   │   ├── silu_mul.py
+│   │   ├── softmax.py
+│   │   └── vector_add.py
 │   └── include/
 │       ├── flash_attn/
-│       │   ├── flashattn_cute.cuh
-│       │   └── softmax.cuh
+│       ├── flash_mla/
+│       ├── fused_moe/
 │       ├── gemm/
-│       │   └── fp16_gemm.cuh
-│       ├── softmax/
-│       │   ├── softmax.cuh
-│       │   └── online_softmax.cuh
-│       └── reduce/
-│           └── reduce.cuh
+│       ├── norm/
+│       ├── reduce/
+│       ├── rope/
+│       └── softmax/
 ├── tests/
-│   ├── test_flashattn_cute.py
-│   ├── test_fp16_gemm.py
-│   ├── test_online_softmax.py
-│   ├── test_softmax.py
-│   ├── test_reduce.py
-│   └── test_jit.py
+│   ├── cuda/
+│   └── triton/
 ├── third-party/
-│   ├── cutlass/                  # CUTLASS + CuTe headers
-│   ├── flashinfer/               # FlashInfer reference headers
-│   ├── ThunderKittens/           # ThunderKittens reference
-│   └── xqa/                      # XQA kernel reference implementations
+│   ├── cutlass/
+│   ├── flashinfer/
+│   ├── ThunderKittens/
+│   └── xqa/
 ├── pyproject.toml
 ├── setup.py
+├── uv.lock
 └── README.md
 ```
 
-📊 Benchmarks
--------------
+### Module Roles
 
-Performance comparisons against PyTorch native backends (cuBLAS for GEMM, SDPA for attention)
-on RTX 4090 (Ada Lovelace, SM89).
+- `fray/jit`: generic CUDA JIT infrastructure.
+- `fray/jit_kernels`: Python-facing CUDA/CuTe kernel wrappers.
+- `fray/include`: CUDA headers and CuTe kernel implementations.
+- `fray/triton`: Triton operator implementations and public Triton APIs.
+- `tests/cuda`: correctness and smoke tests for CUDA/CuTe kernels.
+- `tests/triton`: correctness, diagnostics, and benchmark-oriented Triton tests.
+- `third-party`: vendored or reference implementations used while developing
+  kernels.
 
-### FP16 GEMM
+## Development Notes
 
-| Shape (M×N×K) | Fray (TFLOPS) | cuBLAS (TFLOPS) | Speedup |
-|---------------|---------------|-----------------|---------|
-| 4096×5120×5120 | — | — | — |
-| 4096×1536×24576 | — | — | — |
-| 4096×16384×7168 | — | — | — |
+- Keep CUDA/CuTe JIT code and Triton code separated unless a shared utility is
+  genuinely backend-agnostic.
+- Put public Triton entry points in `fray/triton/__init__.py`.
+- Add focused tests beside the backend being changed: `tests/cuda` for JIT CUDA
+  kernels and `tests/triton` for Triton kernels.
+- Prefer prepared benchmark paths when measuring kernel compute time, and
+  end-to-end benchmark paths when measuring real operator latency.
 
-### Flash Attention
+## License
 
-| Config (B×H×S×D) | Fray (TFLOPS) | SDPA (TFLOPS) | Speedup |
-|-------------------|---------------|---------------|---------|
-| 8×16×1024×64 | — | — | — |
-| 8×64×2048×128 | — | — | — |
-| 8×64×4096×128 | — | — | — |
-
-> Run `python tests/test_fp16_gemm.py` and `python tests/test_flashattn_cute.py` to generate
-> up-to-date numbers for your hardware.
-
-📄 License
-----------
-
-[MIT](LICENSE)
+License file not included yet.

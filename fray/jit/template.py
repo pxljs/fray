@@ -1,5 +1,7 @@
 import copy
 import ctypes
+import ast
+import json
 import os
 import platform
 import torch
@@ -19,6 +21,8 @@ typename_map: Dict[Any, str] = {
     torch.float8_e4m3fn: "torch.float8_e4m3fn",
     torch.cuda.Stream: "torch.cuda.Stream",
 }
+
+type_name_map: Dict[str, Any] = {name: dtype for dtype, name in typename_map.items()}
 
 # `ctype` map for Python casting
 ctype_map: Dict[Any, Any] = {
@@ -59,6 +63,35 @@ def map_ctype(value: Any) -> Any:
     if isinstance(value, torch.cuda.Stream):
         return ctype(value.cuda_stream)
     return ctype(value)
+
+
+def serialize_arg_defs(arg_defs: Iterable[Tuple[str, Any]]) -> str:
+    return json.dumps(
+        [{"name": name, "type": typename_map[dtype]} for name, dtype in arg_defs]
+    )
+
+
+def deserialize_arg_defs(data: str) -> Tuple[Tuple[str, Any], ...]:
+    data = data.strip()
+    if data.startswith("["):
+        records = json.loads(data)
+        return tuple(
+            (record["name"], type_name_map[record["type"]]) for record in records
+        )
+
+    # Backward compatibility with old cache entries that stored Python reprs.
+    legacy_globals = {
+        "__builtins__": {},
+        "bool": bool,
+        "int": int,
+        "float": float,
+        "torch": torch,
+    }
+    try:
+        return tuple(eval(data, legacy_globals, {}))
+    except Exception:
+        # Handles simple literal tuples if a downstream user wrote one by hand.
+        return tuple(ast.literal_eval(data))
 
 
 def cpp_format(template: str, keys: Dict[str, Any]) -> str:
@@ -124,14 +157,13 @@ def generate(includes: Iterable[str], arg_defs: Iterable[Tuple], body: str) -> s
 
     # Function signature with export macro for Windows
     raw = "__raw_"
-    get_def = (
-        lambda n, t: f"{genc_map[t][0]} "
-        + (raw if genc_map[t][0] != genc_map[t][1] else "")
-        + n
-    )
+
+    def get_def(n, t):
+        raw_prefix = raw if genc_map[t][0] != genc_map[t][1] else ""
+        return f"{genc_map[t][0]} {raw_prefix}{n}"
 
     # Add extern "C" and EXPORT_API macro
-    code += f'extern "C" EXPORT_API void launch('
+    code += 'extern "C" EXPORT_API void launch('
     code += ", ".join(
         [get_def(*arg_def) for arg_def in arg_defs]
         + [

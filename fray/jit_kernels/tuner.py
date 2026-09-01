@@ -5,29 +5,57 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict
 
 from ..jit import build, cpp_format, generate, Runtime
+from ..jit.template import serialize_arg_defs
+
+
+def _normalize_space(space: tuple) -> tuple:
+    return tuple(tuple(sorted(config.items())) for config in space)
+
+
+def _get_compile_workers(num_kernels: int) -> int:
+    env_value = os.getenv("FRAY_JIT_MAX_WORKERS")
+    if env_value is not None:
+        return max(1, min(num_kernels, int(env_value)))
+    return min(num_kernels, os.cpu_count() or 4)
+
 
 class JITTuner:
     def __init__(self) -> None:
         self.tuned = {}
 
-    def compile_and_tune(self, name: str, keys: Dict[str, Any], space: tuple,
-                         includes: tuple, arg_defs: tuple, template: str, args: tuple) -> Runtime:
+    def compile_and_tune(
+        self,
+        name: str,
+        keys: Dict[str, Any],
+        space: tuple,
+        includes: tuple,
+        arg_defs: tuple,
+        template: str,
+        args: tuple,
+    ) -> Runtime:
         # NOTES: we always assume the space and template will not change
         # We also assume the GPU device will not be changed
         # NOTES: the function must have no accumulated side effects
         keys = {k: keys[k] for k in sorted(keys.keys())}
-        signature = (name, f'{keys}')
+        signature = (
+            name,
+            repr(keys),
+            repr(tuple(includes)),
+            serialize_arg_defs(arg_defs),
+            template,
+            repr(_normalize_space(space)),
+        )
         if signature in self.tuned:
-            if os.getenv('FRAY_JIT_DEBUG', None):
-                print(f'Using cached JIT kernel {name} with keys {keys}')
+            if os.getenv("FRAY_JIT_DEBUG", None):
+                print(f"Using cached JIT kernel {name} with keys {keys}")
             return self.tuned[signature]
-        
-        if os.getenv('FRAY_JIT_DEBUG', None):
-            print(f'Auto-tuning JIT kernel {name} with keys {keys}')
+
+        if os.getenv("FRAY_JIT_DEBUG", None):
+            print(f"Auto-tuning JIT kernel {name} with keys {keys}")
 
         assert signature not in self.tuned
         assert args is not None
-        space = (dict(), ) if len(space) == 0 else space
+        space = (dict(),) if len(space) == 0 else space
 
         # Phase 1: Generate code for all configs
         code_specs = []
@@ -39,18 +67,26 @@ class JITTuner:
             code_specs.append((code, tuned_keys))
 
         # Phase 2: Compile in parallel (NVCC subprocess releases GIL)
-        max_workers = min(len(code_specs), os.cpu_count() or 4)
+        max_workers = _get_compile_workers(len(code_specs))
         if max_workers > 1 and len(code_specs) > 1:
             kernels = []
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(build, name, arg_defs, code): tuned_keys
-                           for code, tuned_keys in code_specs}
+                futures = {
+                    pool.submit(build, name, arg_defs, code): tuned_keys
+                    for code, tuned_keys in code_specs
+                }
                 for f in as_completed(futures):
                     runtime = f.result()  # Propagates build errors
                     kernels.append((runtime, futures[f]))
         else:
-            kernels = [(build(name, arg_defs, code), tuned_keys)
-                      for code, tuned_keys in code_specs]
+            kernels = [
+                (build(name, arg_defs, code), tuned_keys)
+                for code, tuned_keys in code_specs
+            ]
+
+        l2_flush = None
+        if len(space) > 1:
+            l2_flush = torch.empty(int(128e6 // 4), dtype=torch.int, device="cuda")
 
         best_runtime, best_time, best_keys = None, None, None
         for runtime, tuned_keys in kernels:
@@ -59,16 +95,17 @@ class JITTuner:
                 return_code = runtime(*args)
                 if return_code != 0:
                     # Pass illegal kernels, e.g. insufficient shared memory capacity
-                    if os.getenv('FRAY_JIT_DEBUG', None):
-                        print(f'Illegal JIT kernel {name} with keys {keys} and tuned keys {tuned_keys}: error code {return_code}')
+                    if os.getenv("FRAY_JIT_DEBUG", None):
+                        print(
+                            f"Illegal JIT kernel {name} with keys {keys} and tuned keys {tuned_keys}: error code {return_code}"
+                        )
                     continue
 
-                # Measure performance with L2 flush and a large GEMM kernel before to reduce overhead between kernels
+                # Measure performance after flushing L2 to reduce cache bias.
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
-                # Fray: Optimized for RTX 4090: smaller cache flush (128MB) and reduced GEMM size (4096x4096)
-                torch.empty(int(128e6 // 4), dtype=torch.int, device='cuda').zero_()
-                torch.randn((4096, 4096), dtype=torch.float, device='cuda') @ torch.randn((4096, 4096), dtype=torch.float, device='cuda')
+                assert l2_flush is not None
+                l2_flush.zero_()
                 start_event.record()
                 for i in range(20):
                     assert runtime(*args) == 0
@@ -77,18 +114,25 @@ class JITTuner:
                 elapsed_time = start_event.elapsed_time(end_event)
             else:
                 elapsed_time = 0
-            
+
             # Compare if better
             if best_time is None or elapsed_time < best_time:
                 best_runtime, best_time, best_keys = runtime, elapsed_time, tuned_keys
-            if os.getenv('FRAY_JIT_DEBUG', None):
-                print(f'Tuned JIT kernel {name} with keys {keys} and tuned keys {tuned_keys} has time {elapsed_time}')
-        assert best_runtime is not None, f'Failed to tune JIT kernel {name} with keys {keys}'
+            if os.getenv("FRAY_JIT_DEBUG", None):
+                print(
+                    f"Tuned JIT kernel {name} with keys {keys} and tuned keys {tuned_keys} has time {elapsed_time}"
+                )
+        assert best_runtime is not None, (
+            f"Failed to tune JIT kernel {name} with keys {keys}"
+        )
 
         # Cache the best runtime and return
-        if os.getenv('FRAY_JIT_DEBUG', None) or os.getenv('FRAY_PRINT_AUTOTUNE', None):
-            print(f'Best JIT kernel {name} with keys {keys} has tuned keys {best_keys} and time {best_time}')
+        if os.getenv("FRAY_JIT_DEBUG", None) or os.getenv("FRAY_PRINT_AUTOTUNE", None):
+            print(
+                f"Best JIT kernel {name} with keys {keys} has tuned keys {best_keys} and time {best_time}"
+            )
         self.tuned[signature] = best_runtime
         return best_runtime
-    
+
+
 jit_tuner = JITTuner()

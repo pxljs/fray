@@ -1,28 +1,103 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm"]
+requires = [
+"setuptools>=68",
+"setuptools-scm[toml]>=8",
+"wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fray"
 dynamic = ["version"]
-description = "A JIT-based high-performance operator framework"
+description = "A JIT-based high-performance operator framework for CUDA and Triton kernels"
 readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+{ name = "yongbailuo" },
+]
+dependencies = [
+"torch>=2.6",
+"triton>=3.2",
+"numpy>=1.26",
+"packaging>=24.0",
+"ninja>=1.11",
+"filelock>=3.13",
+]
+
+[project.optional-dependencies]
+test = [
+"pytest>=8.0",
+"pytest-xdist>=3.6",
+"hypothesis>=6.0",
+]
+
+bench = [
+"pandas>=2.2",
+"tabulate>=0.9",
+"matplotlib>=3.8",
+]
+
+dev = [
+"ruff>=0.6",
+"mypy>=1.10",
+"pre-commit>=3.7",
+"ipython>=8.20",
+"build>=1.2",
+"twine>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fray*"]
 
 [tool.setuptools]
-packages = ["fray", "fray.jit", "fray.jit_kernels"]
-# packages = {find = {}}
+include-package-data = true
+
+[tool.setuptools.package-data]
+fray = [
+"include/cute/**/*",
+"include/cutlass/**/*",
+"include/gemm/**/*",
+"include/scan/**/*",
+"include/reduce/**/*",
+"include/softmax/**/*",
+"include/flash_attn/**/*",
+]
 
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"
 local_scheme = "node-and-date"
+version_file = "fray/_version.py"
 
-[tool.setuptools.package-data]
-fray = [
-    "include/cute/**/*",
-    "include/cutlass/**/*",
-    "include/gemm/**/*",
-    "include/scan/**/*",
-    "include/reduce/**/*",
-    "include/softmax/**/*",
-    "include/flash_attn/**/*",
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+
+[dependency-groups]
+test = [
+"pytest>=8.0",
+"pytest-xdist>=3.6",
+"hypothesis>=6.0",
+]
+
+bench = [
+"pandas>=2.2",
+"tabulate>=0.9",
+"matplotlib>=3.8",
+]
+
+dev = [
+"ruff>=0.6",
+"mypy>=1.10",
+"pre-commit>=3.7",
+"ipython>=8.20",
+"build>=1.2",
+"twine>=5.0",
 ]

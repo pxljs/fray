@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
-
 import math
-from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -15,10 +12,10 @@ ATOL = 2.0
 
 
 # ----------------------------------------------------------------------
-# Candidate configs
+# Configs
 # ----------------------------------------------------------------------
 
-G1_BALANCED = {
+G1_LARGE_H = {
     "name": "g1_BM64_BN128_BK32_GM8_W4_S2",
     "BLOCK_M": 64,
     "BLOCK_N": 128,
@@ -26,46 +23,6 @@ G1_BALANCED = {
     "GROUP_M": 8,
     "num_warps": 4,
     "num_stages": 2,
-}
-
-G1_SMALL_M = {
-    "name": "g1_BM32_BN64_BK32_GM8_W4_S2",
-    "BLOCK_M": 32,
-    "BLOCK_N": 64,
-    "BLOCK_K": 32,
-    "GROUP_M": 8,
-    "num_warps": 4,
-    "num_stages": 2,
-}
-
-G1_SAFE = {
-    "name": "g1_BM32_BN32_BK32_GM8_W4_S1",
-    "BLOCK_M": 32,
-    "BLOCK_N": 32,
-    "BLOCK_K": 32,
-    "GROUP_M": 8,
-    "num_warps": 4,
-    "num_stages": 1,
-}
-
-G2_BALANCED = {
-    "name": "g2_BM128_BN128_BK32_GM8_W4_S3",
-    "BLOCK_M": 128,
-    "BLOCK_N": 128,
-    "BLOCK_K": 32,
-    "GROUP_M": 8,
-    "num_warps": 4,
-    "num_stages": 3,
-}
-
-G2_SMALL_M = {
-    "name": "g2_BM32_BN128_BK32_GM8_W4_S3",
-    "BLOCK_M": 32,
-    "BLOCK_N": 128,
-    "BLOCK_K": 32,
-    "GROUP_M": 8,
-    "num_warps": 4,
-    "num_stages": 3,
 }
 
 G2_LARGE_H = {
@@ -78,51 +35,46 @@ G2_LARGE_H = {
     "num_stages": 3,
 }
 
-DEFAULT_GEMM1_SILU_CFG = {
-    "name": "g1_BM64_BN128_BK32_GM8_W4_S2",
-    "BLOCK_M": 64,
-    "BLOCK_N": 128,
+G1_SMALL_M = {
+    "name": "g1_BM32_BN64_BK32_GM8_W4_S2",
+    "BLOCK_M": 32,
+    "BLOCK_N": 64,
     "BLOCK_K": 32,
     "GROUP_M": 8,
     "num_warps": 4,
     "num_stages": 2,
 }
 
-DEFAULT_GEMM2_COMBINE_CFG = {
-    "name": "g2_BM64_BN256_BK32_GM8_W8_S3",
-    "BLOCK_M": 64,
-    "BLOCK_N": 256,
+G2_SMALL_M = {
+    "name": "g2_BM32_BN128_BK32_GM8_W4_S3",
+    "BLOCK_M": 32,
+    "BLOCK_N": 128,
     "BLOCK_K": 32,
     "GROUP_M": 8,
-    "num_warps": 8,
+    "num_warps": 4,
     "num_stages": 3,
 }
 
-# 默认主配置：你当前 sweep 出来的 best。
-DEFAULT_PAIR = {
-    "name": "large_h",
-    "g1": DEFAULT_GEMM1_SILU_CFG,
-    "g2": DEFAULT_GEMM2_COMBINE_CFG,
+G1_SAFE = {
+    "name": "g1_BM32_BN32_BK32_GM8_W4_S1",
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "BLOCK_K": 32,
+    "GROUP_M": 8,
+    "num_warps": 4,
+    "num_stages": 1,
 }
 
+DEFAULT_PAIR = {
+    "name": "large_h",
+    "g1": G1_LARGE_H,
+    "g2": G2_LARGE_H,
+}
 
 CANDIDATE_PAIRS = [
     DEFAULT_PAIR,
-    {
-        "name": "small_m",
-        "g1": G1_SMALL_M,
-        "g2": G2_SMALL_M,
-    },
-    {
-        "name": "large_h",
-        "g1": G1_BALANCED,
-        "g2": G2_LARGE_H,
-    },
-    {
-        "name": "safe",
-        "g1": G1_SAFE,
-        "g2": G2_SMALL_M,
-    },
+    {"name": "small_m", "g1": G1_SMALL_M, "g2": G2_SMALL_M},
+    {"name": "safe", "g1": G1_SAFE, "g2": G2_SMALL_M},
 ]
 
 
@@ -138,7 +90,6 @@ def make_topk_assignments(
     device: str = "cuda",
 ):
     assert top_k <= num_experts
-
     tokens = torch.arange(num_tokens, device=device, dtype=torch.int64)
 
     if mode == "uniform":
@@ -175,7 +126,7 @@ def make_topk_assignments(
             replacement=True,
         ).view(num_tokens, top_k)
 
-        # 测试数据构造阶段，不计入 benchmark。
+        # Only data construction, not benchmarked.
         for t in range(num_tokens):
             used = set()
             for k in range(top_k):
@@ -190,7 +141,6 @@ def make_topk_assignments(
 
     raw = torch.rand((num_tokens, top_k), device=device, dtype=torch.float32)
     topk_weights = raw / raw.sum(dim=-1, keepdim=True)
-
     return topk_ids.contiguous(), topk_weights.contiguous()
 
 
@@ -202,67 +152,13 @@ def init_moe_tensors(
     dtype=torch.float16,
     device="cuda",
 ):
-    x = torch.randn(
-        (num_tokens, hidden_size),
-        device=device,
-        dtype=dtype,
-    ) * 0.02
-
-    w13 = torch.randn(
-        (num_experts, hidden_size, 2 * intermediate_size),
-        device=device,
-        dtype=dtype,
-    ) / math.sqrt(hidden_size)
-
-    w2 = torch.randn(
-        (num_experts, intermediate_size, hidden_size),
-        device=device,
-        dtype=dtype,
-    ) / math.sqrt(intermediate_size)
-
+    x = torch.randn((num_tokens, hidden_size), device=device, dtype=dtype) * 0.02
+    w13 = torch.randn((num_experts, hidden_size, 2 * intermediate_size), device=device, dtype=dtype) / math.sqrt(hidden_size)
+    w2 = torch.randn((num_experts, intermediate_size, hidden_size), device=device, dtype=dtype) / math.sqrt(intermediate_size)
     return x.contiguous(), w13.contiguous(), w2.contiguous()
 
 
-def build_sorted_moe_inputs(
-    x: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    num_experts: int,
-):
-    num_tokens, _ = x.shape
-    _, top_k = topk_ids.shape
-
-    expanded_token_ids = torch.arange(
-        num_tokens,
-        device=x.device,
-        dtype=torch.int64,
-    ).repeat_interleave(top_k)
-
-    expanded_expert_ids = topk_ids.reshape(-1).to(torch.int64)
-    expanded_weights = topk_weights.reshape(-1).to(torch.float32)
-
-    sort_idx = torch.argsort(expanded_expert_ids)
-
-    sorted_expert_ids = expanded_expert_ids[sort_idx]
-    sorted_token_ids = expanded_token_ids[sort_idx].contiguous()
-    sorted_token_weights = expanded_weights[sort_idx].contiguous()
-
-    x_sorted = x[sorted_token_ids].contiguous()
-
-    counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
-
-    expert_offsets = torch.empty(
-        (num_experts + 1,),
-        device=x.device,
-        dtype=torch.int64,
-    )
-    expert_offsets[0] = 0
-    expert_offsets[1:] = torch.cumsum(counts, dim=0)
-
-    return x_sorted, sorted_token_ids, sorted_token_weights, expert_offsets.contiguous(), counts
-
-
-def prepare_case(
+def make_case(
     num_tokens: int,
     num_experts: int,
     hidden_size: int,
@@ -272,36 +168,14 @@ def prepare_case(
     dtype=torch.float16,
     device="cuda",
 ):
-    topk_ids, topk_weights = make_topk_assignments(
-        num_tokens,
-        num_experts,
-        top_k,
-        routing,
-        device=device,
-    )
-
-    x, w13, w2 = init_moe_tensors(
-        num_tokens,
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        dtype=dtype,
-        device=device,
-    )
-
-    x_sorted, sorted_token_ids, sorted_token_weights, expert_offsets, counts = (
-        build_sorted_moe_inputs(x, topk_ids, topk_weights, num_experts)
-    )
-
+    topk_ids, topk_weights = make_topk_assignments(num_tokens, num_experts, top_k, routing, device=device)
+    x, w13, w2 = init_moe_tensors(num_tokens, num_experts, hidden_size, intermediate_size, dtype=dtype, device=device)
     return {
         "x": x,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
         "w13": w13,
         "w2": w2,
-        "x_sorted": x_sorted,
-        "sorted_token_ids": sorted_token_ids,
-        "sorted_token_weights": sorted_token_weights,
-        "expert_offsets": expert_offsets,
-        "counts": counts,
         "num_tokens": num_tokens,
         "num_experts": num_experts,
         "hidden_size": hidden_size,
@@ -312,39 +186,144 @@ def prepare_case(
     }
 
 
+def alloc_workspaces(case):
+    num_tokens = case["num_tokens"]
+    top_k = case["top_k"]
+    H = case["hidden_size"]
+    I = case["intermediate_size"]
+    E = case["num_experts"]
+    T = num_tokens * top_k
+    device = case["x"].device
+    dtype = case["dtype"]
+
+    return {
+        "output": torch.empty((num_tokens, H), device=device, dtype=dtype),
+        "ref": torch.empty((num_tokens, H), device=device, dtype=dtype),
+        "hidden": torch.empty((T, I), device=device, dtype=dtype),
+        "sorted_token_ids": torch.empty((T,), device=device, dtype=torch.int64),
+        "sorted_token_weights": torch.empty((T,), device=device, dtype=case["topk_weights"].dtype),
+        "expert_offsets": torch.empty((E + 1,), device=device, dtype=torch.int64),
+        "expert_cursor": torch.empty((E,), device=device, dtype=torch.int64),
+        "expert_counts": torch.empty((E,), device=device, dtype=torch.int64),
+    }
+
+
 # ----------------------------------------------------------------------
-# Reference and validation
+# Metadata / reference / validation
 # ----------------------------------------------------------------------
 
-def torch_fused_moe_ref(case, output):
-    x_sorted = case["x_sorted"]
+def build_dispatch_metadata(case, workspace=None):
+    kwargs = {}
+    if workspace is not None:
+        kwargs = {
+            "sorted_token_ids": workspace["sorted_token_ids"],
+            "sorted_token_weights": workspace["sorted_token_weights"],
+            "expert_offsets": workspace["expert_offsets"],
+            "expert_cursor": workspace["expert_cursor"],
+        }
+
+    sorted_token_ids, sorted_token_weights, expert_offsets, counts = (
+        fray.triton.build_moe_dispatch_metadata_fast(
+            case["topk_ids"],
+            case["topk_weights"],
+            case["num_experts"],
+            **kwargs,
+        )
+    )
+
+    return {
+        "sorted_token_ids": sorted_token_ids,
+        "sorted_token_weights": sorted_token_weights,
+        "expert_offsets": expert_offsets,
+        "counts": counts,
+    }
+
+
+def build_tile_metadata(case, dispatch, pair):
+    expert_offsets = dispatch["expert_offsets"]
+    I = case["intermediate_size"]
+    H = case["hidden_size"]
+    g1 = pair["g1"]
+    g2 = pair["g2"]
+
+    gemm1_meta = fray.triton.build_grouped_tile_offsets(
+        expert_offsets,
+        I,
+        BLOCK_M=g1["BLOCK_M"],
+        BLOCK_N=g1["BLOCK_N"],
+    )
+
+    gemm2_meta = fray.triton.build_grouped_tile_offsets(
+        expert_offsets,
+        H,
+        BLOCK_M=g2["BLOCK_M"],
+        BLOCK_N=g2["BLOCK_N"],
+    )
+
+    return gemm1_meta, gemm2_meta
+
+
+def torch_fused_moe_ref(case, dispatch, output):
+    x = case["x"]
     w13 = case["w13"]
     w2 = case["w2"]
-    expert_offsets = case["expert_offsets"]
-    sorted_token_ids = case["sorted_token_ids"]
-    sorted_token_weights = case["sorted_token_weights"]
-
-    E, H, two_I = w13.shape
-    _, I, _ = w2.shape
+    sorted_token_ids = dispatch["sorted_token_ids"]
+    sorted_token_weights = dispatch["sorted_token_weights"]
+    expert_offsets = dispatch["expert_offsets"]
+    E = case["num_experts"]
+    I = case["intermediate_size"]
 
     output.zero_()
 
     for e in range(E):
         start = int(expert_offsets[e].item())
         end = int(expert_offsets[e + 1].item())
-
         if end <= start:
             continue
 
-        x_e = x_sorted[start:end]
         token_ids = sorted_token_ids[start:end]
         weights = sorted_token_weights[start:end]
+        x_e = x[token_ids]
 
         tmp13 = torch.mm(x_e, w13[e])
         gate = tmp13[:, :I]
         up = tmp13[:, I:]
+        hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
+        expert_out = torch.mm(hidden, w2[e])
 
-        hidden = (F.silu(gate.float()) * up.float()).to(x_sorted.dtype)
+        output.index_add_(
+            0,
+            token_ids,
+            (expert_out.float() * weights.float()[:, None]).to(output.dtype),
+        )
+
+    return output
+
+
+def torch_fused_moe_full_ref_from_logits(case, router_logits, output):
+    x = case["x"]
+    w13 = case["w13"]
+    w2 = case["w2"]
+    E = case["num_experts"]
+    I = case["intermediate_size"]
+    top_k = case["top_k"]
+
+    topk_vals, topk_ids = torch.topk(router_logits, k=top_k, dim=-1)
+    topk_weights = torch.softmax(topk_vals, dim=-1)
+    output.zero_()
+
+    for e in range(E):
+        token_ids, route_ids = torch.where(topk_ids == e)
+        if token_ids.numel() == 0:
+            continue
+
+        weights = topk_weights[token_ids, route_ids]
+        x_e = x[token_ids]
+
+        tmp13 = torch.mm(x_e, w13[e])
+        gate = tmp13[:, :I]
+        up = tmp13[:, I:]
+        hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
         expert_out = torch.mm(hidden, w2[e])
 
         output.index_add_(
@@ -358,11 +337,10 @@ def torch_fused_moe_ref(case, output):
 
 def compare_outputs(out, ref):
     torch.cuda.synchronize()
-
     out_f = out.float()
     ref_f = ref.float()
-
     finite = torch.isfinite(out_f) & torch.isfinite(ref_f)
+
     nonfinite_out = out.numel() - torch.isfinite(out_f).sum().item()
     nonfinite_ref = ref.numel() - torch.isfinite(ref_f).sum().item()
 
@@ -389,84 +367,99 @@ def compare_outputs(out, ref):
     }
 
 
-def build_metadata(case, pair):
-    H = case["hidden_size"]
-    I = case["intermediate_size"]
-    expert_offsets = case["expert_offsets"]
+# ----------------------------------------------------------------------
+# Run helpers
+# ----------------------------------------------------------------------
 
-    g1 = pair["g1"]
-    g2 = pair["g2"]
+def run_prepared(case, dispatch, tile_meta, pair, output, hidden):
+    use_atomic = case["top_k"] != 1
+    clear_output = use_atomic
+    gemm1_meta, gemm2_meta = tile_meta
 
-    gemm1_metadata = fray.triton.build_grouped_gemm_metadata(
-        expert_offsets,
-        I,
-        BLOCK_M=g1["BLOCK_M"],
-        BLOCK_N=g1["BLOCK_N"],
-        GROUP_M=g1["GROUP_M"],
+    return fray.triton.fused_moe_prepared(
+        case["x"],
+        case["w13"],
+        case["w2"],
+        dispatch["sorted_token_ids"],
+        dispatch["sorted_token_weights"],
+        dispatch["expert_offsets"],
+        output=output,
+        hidden=hidden,
+        gemm1_cfg=pair["g1"],
+        gemm2_cfg=pair["g2"],
+        gemm1_tile_metadata=gemm1_meta,
+        gemm2_tile_metadata=gemm2_meta,
+        use_atomic=use_atomic,
+        clear_output=clear_output,
     )
 
-    gemm2_metadata = fray.triton.build_grouped_gemm_metadata(
-        expert_offsets,
-        H,
-        BLOCK_M=g2["BLOCK_M"],
-        BLOCK_N=g2["BLOCK_N"],
-        GROUP_M=g2["GROUP_M"],
-    )
 
-    return gemm1_metadata, gemm2_metadata
-
-
-def run_triton_fused_moe(
-    case,
-    pair,
-    output,
-    metadata,
-    hidden_workspace=None,
-    persistent_gemm2: bool = False,
-    persistent_waves: int = 2,
-):
-    gemm1_metadata, gemm2_metadata = metadata
-
+def run_public(case, pair, workspace, persistent_waves="auto"):
     use_atomic = case["top_k"] != 1
     clear_output = use_atomic
 
-    fray.triton.fused_moe(
-        case["x_sorted"],
+    return fray.triton.fused_moe(
+        case["x"],
+        case["topk_ids"],
+        case["topk_weights"],
         case["w13"],
         case["w2"],
-        case["expert_offsets"],
-        case["sorted_token_ids"],
-        case["sorted_token_weights"],
-        output=output,
-        num_tokens=case["num_tokens"],
+        output=workspace["output"],
+        hidden=workspace["hidden"],
+        sorted_token_ids=workspace["sorted_token_ids"],
+        sorted_token_weights=workspace["sorted_token_weights"],
+        expert_offsets=workspace["expert_offsets"],
+        expert_cursor=workspace["expert_cursor"],
         gemm1_cfg=pair["g1"],
         gemm2_cfg=pair["g2"],
-        gemm1_metadata=gemm1_metadata,
-        gemm2_metadata=gemm2_metadata,
         use_atomic=use_atomic,
         clear_output=clear_output,
-        persistent_gemm2=persistent_gemm2,
         persistent_waves=persistent_waves,
-        hidden=hidden_workspace,
     )
+
+
+def run_public_logits(case, router_logits, pair, workspace, persistent_waves="auto"):
+    use_atomic = case["top_k"] != 1
+    clear_output = use_atomic
+
+    return fray.triton.fused_moe(
+        case["x"],
+        None,
+        None,
+        case["w13"],
+        case["w2"],
+        router_logits=router_logits,
+        top_k=case["top_k"],
+        output=workspace["output"],
+        hidden=workspace["hidden"],
+        sorted_token_ids=workspace["sorted_token_ids"],
+        sorted_token_weights=workspace["sorted_token_weights"],
+        expert_offsets=workspace["expert_offsets"],
+        expert_cursor=workspace["expert_cursor"],
+        expert_counts=workspace["expert_counts"],
+        gemm1_cfg=pair["g1"],
+        gemm2_cfg=pair["g2"],
+        use_atomic=use_atomic,
+        clear_output=clear_output,
+        persistent_waves=persistent_waves,
+    )
+
+
+def warmup_public_autotune(case, pair, workspace):
+    run_public(case, pair, workspace, persistent_waves="auto")
+    run_public(case, pair, workspace, persistent_waves="auto")
+    torch.cuda.synchronize()
+
+
+def warmup_public_logits_autotune(case, router_logits, pair, workspace):
+    run_public_logits(case, router_logits, pair, workspace, persistent_waves="auto")
+    run_public_logits(case, router_logits, pair, workspace, persistent_waves="auto")
+    torch.cuda.synchronize()
 
 
 # ----------------------------------------------------------------------
 # Reporting
 # ----------------------------------------------------------------------
-
-def print_distribution(case):
-    counts = case["counts"].detach().cpu().tolist()
-    active = sum(1 for x in counts if x > 0)
-
-    print(f"tokens       : {case['num_tokens']}")
-    print(f"top_k        : {case['top_k']}")
-    print(f"expanded     : {case['num_tokens'] * case['top_k']}")
-    print(f"experts      : {case['num_experts']}")
-    print(f"active       : {active}")
-    print(f"max/expert   : {max(counts) if counts else 0}")
-    print(f"counts sample: {counts[:min(16, len(counts))]}")
-
 
 def case_title(case):
     return (
@@ -476,15 +469,30 @@ def case_title(case):
     )
 
 
+def print_distribution(case, dispatch):
+    counts = dispatch["counts"].detach().cpu().tolist()
+    active = sum(1 for x in counts if x > 0)
+    print(f"tokens       : {case['num_tokens']}")
+    print(f"top_k        : {case['top_k']}")
+    print(f"expanded     : {case['num_tokens'] * case['top_k']}")
+    print(f"experts      : {case['num_experts']}")
+    print(f"active       : {active}")
+    print(f"max/expert   : {max(counts) if counts else 0}")
+    print(f"counts sample: {counts[:min(16, len(counts))]}")
+
+
+def tile_counts(tile_meta):
+    return tile_meta[0][1], tile_meta[1][1]
+
+
 # ----------------------------------------------------------------------
 # Tests
 # ----------------------------------------------------------------------
 
 def accuracy_test():
     torch.manual_seed(42)
-
     print("\n" + "=" * 80)
-    print("Accuracy Test: fused_moe")
+    print("Accuracy Test: indirect fused_moe")
     print("=" * 80)
 
     cases = [
@@ -495,29 +503,23 @@ def accuracy_test():
     ]
 
     for args in cases:
-        case = prepare_case(*args)
+        case = make_case(*args)
+        workspace = alloc_workspaces(case)
         pair = DEFAULT_PAIR
 
-        out = torch.empty(
-            (case["num_tokens"], case["hidden_size"]),
-            device="cuda",
-            dtype=case["dtype"],
-        )
+        dispatch = build_dispatch_metadata(case, workspace)
+        tile_meta = build_tile_metadata(case, dispatch, pair)
 
-        ref = torch.empty_like(out)
+        run_prepared(case, dispatch, tile_meta, pair, workspace["output"], workspace["hidden"])
+        torch_fused_moe_ref(case, dispatch, workspace["ref"])
 
-        metadata = build_metadata(case, pair)
-
-        run_triton_fused_moe(case, pair, out, metadata)
-        torch_fused_moe_ref(case, ref)
-
-        stats = compare_outputs(out, ref)
+        stats = compare_outputs(workspace["output"], workspace["ref"])
+        g1_tiles, g2_tiles = tile_counts(tile_meta)
 
         print("\n" + case_title(case))
-        print_distribution(case)
+        print_distribution(case, dispatch)
         print(f"config       : {pair['name']}")
-        print(f"sample out   : {out[0, :4].tolist()}")
-        print(f"sample ref   : {ref[0, :4].tolist()}")
+        print(f"G1/G2 tiles  : {g1_tiles} / {g2_tiles}")
         print(f"accuracy     : {'PASS' if stats['ok'] else 'FAIL'}")
         print(f"max diff     : {stats['max_diff']:.6f}")
         print(f"mean diff    : {stats['mean_diff']:.6f}")
@@ -525,56 +527,150 @@ def accuracy_test():
         print(f"nonfinite ref: {stats['nonfinite_ref']}")
 
 
-def perf_test():
+def routing_selection_test():
     torch.manual_seed(42)
-
     print("\n" + "=" * 80)
-    print("Performance Test: fused_moe vs torch reference")
+    print("Routing Selection Test: router_logits path")
     print("=" * 80)
 
+    num_tokens, num_experts, top_k = 96, 8, 2
+    logits = torch.randn((num_tokens, num_experts), device="cuda", dtype=torch.float32)
+
+    topk_ids = torch.empty((num_tokens, top_k), device="cuda", dtype=torch.int64)
+    topk_weights = torch.empty((num_tokens, top_k), device="cuda", dtype=torch.float32)
+    counts = torch.empty((num_experts,), device="cuda", dtype=torch.int64)
+    fray.triton.moe_select_topk_softmax_with_counts(
+        logits,
+        top_k,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        counts=counts,
+    )
+
+    ref_vals, ref_ids = torch.topk(logits, k=top_k, dim=-1)
+    ref_weights = torch.softmax(ref_vals, dim=-1)
+    ref_counts = torch.bincount(ref_ids.reshape(-1), minlength=num_experts)
+    counted = fray.triton.moe_count_experts(topk_ids, num_experts)
+    torch.cuda.synchronize()
+
+    ids_ok = torch.equal(topk_ids, ref_ids)
+    weights_ok = torch.allclose(topk_weights, ref_weights, rtol=1e-4, atol=1e-4)
+    counts_ok = torch.equal(counts, ref_counts)
+    count_kernel_ok = torch.equal(counted, ref_counts)
+    print(f"topk ids     : {'PASS' if ids_ok else 'FAIL'}")
+    print(f"topk weights : {'PASS' if weights_ok else 'FAIL'}")
+    print(f"counts       : {'PASS' if counts_ok else 'FAIL'}")
+    print(f"count kernel : {'PASS' if count_kernel_ok else 'FAIL'}")
+
+    if not ids_ok or not weights_ok or not counts_ok or not count_kernel_ok:
+        raise AssertionError("router top-k selection mismatch")
+
+    case = make_case(num_tokens, num_experts, 128, 256, top_k, "uniform")
+    case["topk_ids"] = topk_ids
+    case["topk_weights"] = topk_weights
+    workspace = alloc_workspaces(case)
+    pair = DEFAULT_PAIR
+
+    output = fray.triton.fused_moe(
+        case["x"],
+        None,
+        None,
+        case["w13"],
+        case["w2"],
+        router_logits=logits,
+        top_k=top_k,
+        output=workspace["output"],
+        hidden=workspace["hidden"],
+        sorted_token_ids=workspace["sorted_token_ids"],
+        sorted_token_weights=workspace["sorted_token_weights"],
+        expert_offsets=workspace["expert_offsets"],
+        expert_cursor=workspace["expert_cursor"],
+        expert_counts=counts,
+        gemm1_cfg=pair["g1"],
+        gemm2_cfg=pair["g2"],
+        persistent_waves=3,
+    )
+
+    dispatch = build_dispatch_metadata(case, workspace)
+    torch_fused_moe_ref(case, dispatch, workspace["ref"])
+    stats = compare_outputs(output, workspace["ref"])
+    print(f"fused output : {'PASS' if stats['ok'] else 'FAIL'}")
+    print(f"max diff     : {stats['max_diff']:.6f}")
+
+    if not stats["ok"]:
+        raise AssertionError("router_logits fused_moe output mismatch")
+
+
+def perf_test():
+    torch.manual_seed(42)
+    print("\n" + "=" * 80)
+    print("Performance Test: Triton fused MoE vs pure PyTorch MoE")
+    print("=" * 80)
+    print("Triton cached_auto excludes the first-run persistent_waves autotune cost.")
+
     cases = [
+        (512, 8, 1024, 2816, 1, "uniform"),
         (512, 8, 1024, 2816, 2, "uniform"),
         (512, 8, 1024, 2816, 2, "skewed"),
         (1024, 16, 2048, 5632, 2, "skewed"),
     ]
 
     for args in cases:
-        case = prepare_case(*args)
+        case = make_case(*args)
+        workspace = alloc_workspaces(case)
         pair = DEFAULT_PAIR
 
-        out = torch.empty(
-            (case["num_tokens"], case["hidden_size"]),
-            device="cuda",
-            dtype=case["dtype"],
-        )
+        dispatch = build_dispatch_metadata(case, workspace)
+        tile_meta = build_tile_metadata(case, dispatch, pair)
 
-        hidden_workspace = torch.empty(
-            (
-                case["num_tokens"] * case["top_k"],
-                case["intermediate_size"],
-            ),
-            device="cuda",
-            dtype=case["dtype"],
-            )
+        def run_triton_prepared():
+            run_prepared(case, dispatch, tile_meta, pair, workspace["output"], workspace["hidden"])
 
-        ref = torch.empty_like(out)
+        def run_triton_topk_e2e():
+            run_public(case, pair, workspace)
 
-        metadata = build_metadata(case, pair)
+        def run_torch_prepared():
+            torch_fused_moe_ref(case, dispatch, workspace["ref"])
 
-        def run_triton():
-            run_triton_fused_moe(case, pair, out, metadata, hidden_workspace)
-
-        def run_ref():
-            torch_fused_moe_ref(case, ref)
-
-        run_triton()
-        run_ref()
+        run_triton_prepared()
+        warmup_public_autotune(case, pair, workspace)
+        run_torch_prepared()
         torch.cuda.synchronize()
 
-        stats = compare_outputs(out, ref)
+        stats = compare_outputs(workspace["output"], workspace["ref"])
 
-        t_triton = bench_kineto(run_triton, "triton_fused_moe")
-        t_ref = bench_kineto(run_ref, "torch_fused_moe_ref")
+        t_prepared = bench_kineto(run_triton_prepared, "fused_moe_prepared")
+        t_torch_prepared = bench_kineto(run_torch_prepared, "torch_moe_prepared")
+        t_topk_e2e = bench_kineto(run_triton_topk_e2e, "fused_moe_topk_e2e_cached_auto")
+
+        router_logits = torch.randn(
+            (case["num_tokens"], case["num_experts"]),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        logits_case = dict(case)
+        logits_vals, logits_ids = torch.topk(router_logits, k=case["top_k"], dim=-1)
+        logits_case["topk_ids"] = logits_ids.contiguous()
+        logits_case["topk_weights"] = torch.softmax(logits_vals, dim=-1).contiguous()
+        logits_workspace = alloc_workspaces(logits_case)
+
+        def run_triton_logits_e2e():
+            run_public_logits(logits_case, router_logits, pair, logits_workspace)
+
+        def run_torch_logits_e2e():
+            torch_fused_moe_full_ref_from_logits(
+                logits_case,
+                router_logits,
+                logits_workspace["ref"],
+            )
+
+        warmup_public_logits_autotune(logits_case, router_logits, pair, logits_workspace)
+        run_torch_logits_e2e()
+        torch.cuda.synchronize()
+        logits_stats = compare_outputs(logits_workspace["output"], logits_workspace["ref"])
+
+        t_logits_e2e = bench_kineto(run_triton_logits_e2e, "fused_moe_logits_e2e_cached_auto")
+        t_torch_logits_e2e = bench_kineto(run_torch_logits_e2e, "torch_moe_logits_e2e")
 
         T = case["num_tokens"] * case["top_k"]
         H = case["hidden_size"]
@@ -582,268 +678,222 @@ def perf_test():
         flops = 6.0 * T * H * I
 
         print("\n" + case_title(case))
-        print_distribution(case)
+        print_distribution(case, dispatch)
         print(f"config       : {pair['name']}")
         print(f"accuracy     : {'PASS' if stats['ok'] else 'FAIL'}")
-        print(f"triton       : {t_triton * 1e6:8.2f} us | {flops / t_triton / 1e12:8.2f} TFLOPS")
-        print(f"torch ref    : {t_ref * 1e6:8.2f} us | {flops / t_ref / 1e12:8.2f} TFLOPS")
-        print(f"speedup      : {t_ref / t_triton:8.2f}x")
-        print(f"max diff     : {stats['max_diff']:.6f}")
-        print(f"mean diff    : {stats['mean_diff']:.6f}")
+        print(f"full accuracy: {'PASS' if logits_stats['ok'] else 'FAIL'}")
+        print(f"triton full  : {t_logits_e2e * 1e6:8.2f} us | cached auto | {flops / t_logits_e2e / 1e12:8.2f} TFLOPS")
+        print(f"torch full   : {t_torch_logits_e2e * 1e6:8.2f} us | pure PyTorch logits input")
+        print(f"full speedup : {t_torch_logits_e2e / t_logits_e2e:8.2f}x")
+        print(f"triton topk  : {t_topk_e2e * 1e6:8.2f} us | topk ids/weights input")
+        print(f"compute only : triton={t_prepared * 1e6:8.2f} us, torch={t_torch_prepared * 1e6:8.2f} us, speedup={t_torch_prepared / t_prepared:6.2f}x")
+        print(f"max diff     : {logits_stats['max_diff']:.6f}")
+        print(f"mean diff    : {logits_stats['mean_diff']:.6f}")
+
+
+def breakdown_test():
+    torch.manual_seed(42)
+    print("\n" + "=" * 80)
+    print("Breakdown Test: dispatch / tile metadata / prepared kernel / public")
+    print("=" * 80)
+    print("public cached_auto excludes the first-run persistent_waves autotune cost.")
+
+    cases = [
+        (512, 8, 1024, 2816, 1, "uniform"),
+        (512, 8, 1024, 2816, 2, "uniform"),
+        (1024, 16, 2048, 5632, 2, "skewed"),
+    ]
+
+    for args in cases:
+        case = make_case(*args)
+        workspace = alloc_workspaces(case)
+        pair = DEFAULT_PAIR
+
+        def run_dispatch():
+            return build_dispatch_metadata(case, workspace)
+
+        dispatch = run_dispatch()
+
+        def run_tile_metadata():
+            return build_tile_metadata(case, dispatch, pair)
+
+        tile_meta = run_tile_metadata()
+
+        def run_tile_metadata_no_sync():
+            expert_offsets = dispatch["expert_offsets"]
+            total_tokens = case["num_tokens"] * case["top_k"]
+            g1 = pair["g1"]
+            g2 = pair["g2"]
+            return fray.triton.build_grouped_tile_offsets_pair_no_sync(
+                expert_offsets,
+                case["intermediate_size"],
+                case["hidden_size"],
+                BLOCK_M1=g1["BLOCK_M"],
+                BLOCK_N1=g1["BLOCK_N"],
+                BLOCK_M2=g2["BLOCK_M"],
+                BLOCK_N2=g2["BLOCK_N"],
+                total_tokens=total_tokens,
+            )
+
+        tile_meta_no_sync = run_tile_metadata_no_sync()
+
+        def run_prepared_kernel():
+            run_prepared(case, dispatch, tile_meta, pair, workspace["output"], workspace["hidden"])
+
+        def run_prepared_kernel_no_sync():
+            run_prepared(case, dispatch, tile_meta_no_sync, pair, workspace["output"], workspace["hidden"])
+
+        def run_public_fused_moe():
+            run_public(case, pair, workspace)
+
+        def run_public_fused_moe_w3():
+            run_public(case, pair, workspace, persistent_waves=3)
+
+        def run_public_fused_moe_pair():
+            run_public(case, pair, workspace, persistent_waves=(3, 2))
+
+        run_dispatch()
+        run_tile_metadata()
+        run_tile_metadata_no_sync()
+        run_prepared_kernel()
+        run_prepared_kernel_no_sync()
+        warmup_public_autotune(case, pair, workspace)
+        run_public_fused_moe_w3()
+        run_public_fused_moe_pair()
+        torch.cuda.synchronize()
+
+        t_dispatch = bench_kineto(run_dispatch, "dispatch_metadata_fast")
+        t_tile_meta = bench_kineto(run_tile_metadata, "grouped_tile_offsets_exact")
+        t_tile_meta_no_sync = bench_kineto(run_tile_metadata_no_sync, "grouped_tile_offsets_no_sync")
+        t_prepared = bench_kineto(run_prepared_kernel, "fused_moe_prepared_kernel")
+        t_prepared_no_sync = bench_kineto(run_prepared_kernel_no_sync, "fused_moe_prepared_no_sync_grid")
+        t_public = bench_kineto(run_public_fused_moe, "fused_moe_public_e2e_cached_auto")
+        t_public_w3 = bench_kineto(run_public_fused_moe_w3, "fused_moe_public_e2e_w3")
+        t_public_pair = bench_kineto(run_public_fused_moe_pair, "fused_moe_public_e2e_w3_w2")
+
+        accounted_w3 = t_dispatch + t_tile_meta_no_sync + t_prepared_no_sync
+        unaccounted_w3 = t_public_w3 - accounted_w3
+        unaccounted_auto = t_public - accounted_w3
+        g1_tiles, g2_tiles = tile_counts(tile_meta)
+        g1_launch_programs, g2_launch_programs = tile_counts(tile_meta_no_sync)
+
+        print("\n" + case_title(case))
+        print_distribution(case, dispatch)
+        print(f"G1/G2 tiles       : {g1_tiles} / {g2_tiles}")
+        print(f"G1/G2 launch progs: {g1_launch_programs} / {g2_launch_programs}")
+        print(f"dispatch metadata : {t_dispatch * 1e6:8.2f} us")
+        print(f"tile exact        : {t_tile_meta * 1e6:8.2f} us")
+        print(f"tile no-sync      : {t_tile_meta_no_sync * 1e6:8.2f} us")
+        print(f"prepared exact    : {t_prepared * 1e6:8.2f} us")
+        print(f"prepared no-sync  : {t_prepared_no_sync * 1e6:8.2f} us")
+        print(f"public e2e        : {t_public * 1e6:8.2f} us")
+        print(f"public e2e w3     : {t_public_w3 * 1e6:8.2f} us")
+        print(f"public e2e w3/w2  : {t_public_pair * 1e6:8.2f} us")
+        print(f"accounted w3 sum  : {accounted_w3 * 1e6:8.2f} us")
+        print(f"unaccounted auto  : {unaccounted_auto * 1e6:8.2f} us")
+        print(f"unaccounted w3    : {unaccounted_w3 * 1e6:8.2f} us")
+        print(f"dispatch %        : {t_dispatch / t_public * 100:8.2f}%")
+        print(f"tile no-sync %    : {t_tile_meta_no_sync / t_public * 100:8.2f}%")
+        print(f"prepared no-sync %: {t_prepared_no_sync / t_public * 100:8.2f}%")
 
 
 def robust_config_sweep():
-    """
-    多 shape 汇总。
-
-    目标不是找每个 shape 的单点最优，而是找一个鲁棒默认配置：
-        ratio = 当前配置耗时 / 当前 shape 最快耗时
-
-    重点看：
-        avg_ratio
-        worst_ratio
-        wins
-        failures
-    """
-
     torch.manual_seed(42)
-
     print("\n" + "=" * 80)
-    print("Robust Config Sweep")
+    print("Robust Config Sweep: indirect fused_moe_prepared")
     print("=" * 80)
 
     cases = [
         (512, 8, 1024, 2816, 2, "uniform"),
         (512, 8, 1024, 2816, 2, "skewed"),
-        (512, 8, 1024, 2816, 2, "with_empty"),
         (1024, 16, 2048, 5632, 2, "uniform"),
         (1024, 16, 2048, 5632, 2, "skewed"),
-        (1024, 16, 2048, 5632, 2, "with_empty"),
     ]
 
-    summary = {
-        pair["name"]: {
-            "ratios": [],
-            "wins": 0,
-            "failures": 0,
-            "times": [],
-        }
-        for pair in CANDIDATE_PAIRS
-    }
+    summary = {p["name"]: {"times": [], "ratios": [], "wins": 0, "fail": 0} for p in CANDIDATE_PAIRS}
 
     for args in cases:
-        case = prepare_case(*args)
+        case = make_case(*args)
+        workspace = alloc_workspaces(case)
 
-        ref = torch.empty(
-            (case["num_tokens"], case["hidden_size"]),
-            device="cuda",
-            dtype=case["dtype"],
-        )
-        torch_fused_moe_ref(case, ref)
+        dispatch = build_dispatch_metadata(case, workspace)
+        torch_fused_moe_ref(case, dispatch, workspace["ref"])
         torch.cuda.synchronize()
 
+        results = []
         print("\n" + "-" * 80)
         print(case_title(case))
-        print_distribution(case)
-
-        case_results = []
+        print_distribution(case, dispatch)
 
         for pair in CANDIDATE_PAIRS:
-            out = torch.empty_like(ref)
-
             try:
-                metadata = build_metadata(case, pair)
+                tile_meta = build_tile_metadata(case, dispatch, pair)
 
-                def run_triton():
-                    run_triton_fused_moe(case, pair, out, metadata)
+                def run_candidate():
+                    run_prepared(case, dispatch, tile_meta, pair, workspace["output"], workspace["hidden"])
 
-                run_triton()
+                run_candidate()
                 torch.cuda.synchronize()
-
-                stats = compare_outputs(out, ref)
-
+                stats = compare_outputs(workspace["output"], workspace["ref"])
                 if not stats["ok"]:
-                    raise RuntimeError(
-                        f"accuracy failed: max={stats['max_diff']:.6f}, mean={stats['mean_diff']:.6f}"
-                    )
+                    raise RuntimeError(f"accuracy failed, max_diff={stats['max_diff']:.6f}")
 
-                t = bench_kineto(run_triton, f"fused_moe_{pair['name']}")
-                case_results.append((pair["name"], t, stats, metadata))
+                t = bench_kineto(run_candidate, f"fused_moe_{pair['name']}")
+                results.append((pair["name"], t, stats, tile_meta))
 
             except Exception as e:
-                summary[pair["name"]]["failures"] += 1
-                print(f"{pair['name']:>12}: FAIL | {type(e).__name__}: {str(e).splitlines()[0][:120]}")
+                summary[pair["name"]]["fail"] += 1
+                print(f"{pair['name']:>10}: FAIL | {type(e).__name__}: {str(e).splitlines()[0][:120]}")
 
-        if not case_results:
-            print("No valid configs for this case.")
+        if not results:
             continue
 
-        best_time = min(x[1] for x in case_results)
-        best_name = min(case_results, key=lambda x: x[1])[0]
+        best_t = min(r[1] for r in results)
+        best_name = min(results, key=lambda x: x[1])[0]
 
-        for name, t, stats, metadata in case_results:
-            ratio = t / best_time
-
-            summary[name]["ratios"].append(ratio)
+        for name, t, stats, tile_meta in results:
+            ratio = t / best_t
             summary[name]["times"].append(t)
-
+            summary[name]["ratios"].append(ratio)
             if name == best_name:
                 summary[name]["wins"] += 1
-
-            g1_tiles = metadata[0][0].numel()
-            g2_tiles = metadata[1][0].numel()
-
+            g1_tiles, g2_tiles = tile_counts(tile_meta)
             print(
-                f"{name:>12}: "
-                f"{t * 1e6:8.2f} us | "
+                f"{name:>10}: {t * 1e6:8.2f} us | "
                 f"ratio={ratio:5.3f} | "
-                f"G1_tiles={g1_tiles:5d} | "
-                f"G2_tiles={g2_tiles:5d} | "
+                f"G1/G2 tiles={g1_tiles}/{g2_tiles} | "
                 f"max_diff={stats['max_diff']:.6f}"
             )
 
     print("\n" + "=" * 80)
     print("Robust Config Summary")
     print("=" * 80)
+    print(f"{'config':>10} | {'avg_ratio':>9} | {'worst':>9} | {'wins':>4} | {'fail':>4} | {'avg_us':>10}")
+    print("-" * 64)
 
     rows = []
-
     for pair in CANDIDATE_PAIRS:
         name = pair["name"]
         item = summary[name]
         ratios = item["ratios"]
-
         if ratios:
             avg_ratio = sum(ratios) / len(ratios)
-            worst_ratio = max(ratios)
-            avg_time_us = sum(item["times"]) / len(item["times"]) * 1e6
+            worst = max(ratios)
+            avg_us = sum(item["times"]) / len(item["times"]) * 1e6
         else:
             avg_ratio = float("inf")
-            worst_ratio = float("inf")
-            avg_time_us = float("inf")
-
-        rows.append(
-            (
-                avg_ratio,
-                worst_ratio,
-                -item["wins"],
-                item["failures"],
-                avg_time_us,
-                name,
-            )
-        )
+            worst = float("inf")
+            avg_us = float("inf")
+        rows.append((avg_ratio, worst, -item["wins"], item["fail"], avg_us, name))
 
     rows.sort()
+    for avg_ratio, worst, neg_wins, fail, avg_us, name in rows:
+        print(f"{name:>10} | {avg_ratio:9.3f} | {worst:9.3f} | {-neg_wins:4d} | {fail:4d} | {avg_us:10.2f}")
 
-    print(
-        f"{'config':>12} | "
-        f"{'avg_ratio':>9} | "
-        f"{'worst':>9} | "
-        f"{'wins':>4} | "
-        f"{'fail':>4} | "
-        f"{'avg_us':>10}"
-    )
-    print("-" * 64)
-
-    for avg_ratio, worst_ratio, neg_wins, failures, avg_time_us, name in rows:
-        print(
-            f"{name:>12} | "
-            f"{avg_ratio:9.3f} | "
-            f"{worst_ratio:9.3f} | "
-            f"{-neg_wins:4d} | "
-            f"{failures:4d} | "
-            f"{avg_time_us:10.2f}"
-        )
-
-    best_name = rows[0][-1]
-    print("\nRecommended robust default config:", best_name)
-
-    for pair in CANDIDATE_PAIRS:
-        if pair["name"] == best_name:
-            print("GEMM1:")
-            print(pair["g1"])
-            print("GEMM2:")
-            print(pair["g2"])
-            break
-
-    print("=" * 80 + "\n")
-
-def persistent_gemm2_test():
-    torch.manual_seed(42)
-
-    print("\n" + "=" * 80)
-    print("Persistent GEMM2 Test")
-    print("=" * 80)
-
-    cases = [
-        (512, 8, 1024, 2816, 2, "uniform"),
-        (512, 8, 1024, 2816, 2, "skewed"),
-        (1024, 16, 2048, 5632, 2, "uniform"),
-        (1024, 16, 2048, 5632, 2, "skewed"),
-        (1024, 16, 2048, 5632, 2, "with_empty"),
-    ]
-
-    pair = DEFAULT_PAIR
-
-    for args in cases:
-        case = prepare_case(*args)
-
-        out_normal = torch.empty(
-            (case["num_tokens"], case["hidden_size"]),
-            device="cuda",
-            dtype=case["dtype"],
-        )
-
-        out_persistent = torch.empty_like(out_normal)
-        ref = torch.empty_like(out_normal)
-
-        metadata = build_metadata(case, pair)
-
-        torch_fused_moe_ref(case, ref)
-
-        def run_normal():
-            run_triton_fused_moe(
-                case,
-                pair,
-                out_normal,
-                metadata,
-                persistent_gemm2=False,
-            )
-
-        def run_persistent():
-            run_triton_fused_moe(
-                case,
-                pair,
-                out_persistent,
-                metadata,
-                persistent_gemm2=True,
-                persistent_waves=16,
-            )
-
-        run_normal()
-        run_persistent()
-        torch.cuda.synchronize()
-
-        normal_stats = compare_outputs(out_normal, ref)
-        persistent_stats = compare_outputs(out_persistent, ref)
-
-        t_normal = bench_kineto(run_normal, "fused_moe_normal_gemm2")
-        t_persistent = bench_kineto(run_persistent, "fused_moe_persistent_gemm2")
-
-        print("\n" + case_title(case))
-        print_distribution(case)
-        print(f"normal accuracy     : {'PASS' if normal_stats['ok'] else 'FAIL'}")
-        print(f"persistent accuracy : {'PASS' if persistent_stats['ok'] else 'FAIL'}")
-        print(f"normal time         : {t_normal * 1e6:8.2f} us")
-        print(f"persistent time     : {t_persistent * 1e6:8.2f} us")
-        print(f"persistent speedup  : {t_normal / t_persistent:8.2f}x")
-        print(f"persistent max diff : {persistent_stats['max_diff']:.6f}")
-        print(f"persistent mean diff: {persistent_stats['mean_diff']:.6f}")
-
-    print("=" * 80 + "\n")
 
 if __name__ == "__main__":
     # accuracy_test()
+    # routing_selection_test()
     perf_test()
+    # breakdown_test()
     # robust_config_sweep()
-    # persistent_gemm2_test()
