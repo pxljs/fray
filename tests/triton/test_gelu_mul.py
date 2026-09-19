@@ -5,8 +5,8 @@ import fray
 from fray import bench_kineto
 
 
-def torch_gelu_mul(gate: torch.Tensor, up: torch.Tensor):
-    return F.gelu(gate) * up
+def torch_gelu_mul(gate: torch.Tensor, up: torch.Tensor, approximate: str = "none"):
+    return F.gelu(gate, approximate=approximate) * up
 
 
 def gelu_mul_accuracy_test():
@@ -53,6 +53,33 @@ def test_gelu_mul_accuracy():
     gelu_mul_accuracy_test()
 
 
+def test_gelu_mul_tanh_approx_accuracy():
+    torch.manual_seed(42)
+
+    test_cases = [
+        (1024, torch.float16),
+        (1024 * 1024 + 123, torch.float16),
+        (1024 * 1024 + 31, torch.bfloat16),
+    ]
+
+    for n_elements, dtype in test_cases:
+        gate = torch.randn(n_elements, device="cuda", dtype=dtype)
+        up = torch.randn(n_elements, device="cuda", dtype=dtype)
+        out_triton = torch.empty_like(gate)
+
+        fray.triton.gelu_mul(gate, up, out_triton, approximate="tanh")
+        out_ref = torch_gelu_mul(gate, up, approximate="tanh")
+        torch.cuda.synchronize()
+
+        max_diff = torch.max(torch.abs(out_triton - out_ref)).item()
+        is_close = torch.allclose(out_triton, out_ref, rtol=1e-2, atol=1e-2)
+        assert is_close, {
+            "n_elements": n_elements,
+            "dtype": dtype,
+            "max_diff": max_diff,
+        }
+
+
 def test_gelu_mul_performance():
     print("\n" + "=" * 60)
     print("Performance Benchmark: Triton GELU-Mul vs PyTorch F.gelu(x) * y")
@@ -72,60 +99,63 @@ def test_gelu_mul_performance():
         64 * 1024 * 1024,
     ]
 
-    for n_elements in test_cases:
-        print(f"\nConfiguration: N={n_elements}, dtype={dtype}")
+    for approximate in ("none", "tanh"):
+        print(f"\nApproximate mode: {approximate}")
 
-        gate = torch.randn(n_elements, device="cuda", dtype=dtype)
-        up = torch.randn(n_elements, device="cuda", dtype=dtype)
+        for n_elements in test_cases:
+            print(f"\nConfiguration: N={n_elements}, dtype={dtype}")
 
-        out_triton = torch.empty_like(gate)
-        out_torch = torch.empty_like(gate)
+            gate = torch.randn(n_elements, device="cuda", dtype=dtype)
+            up = torch.randn(n_elements, device="cuda", dtype=dtype)
 
-        def run_triton():
-            fray.triton.gelu_mul(gate, up, out_triton)
+            out_triton = torch.empty_like(gate)
+            out_torch = torch.empty_like(gate)
 
-        def run_torch():
-            torch.mul(F.gelu(gate), up, out=out_torch)
+            def run_triton():
+                fray.triton.gelu_mul(gate, up, out_triton, approximate=approximate)
 
-        run_triton()
-        run_torch()
-        torch.cuda.synchronize()
+            def run_torch():
+                torch.mul(F.gelu(gate, approximate=approximate), up, out=out_torch)
 
-        max_diff = torch.max(torch.abs(out_triton - out_torch)).item()
-        mean_diff = torch.mean(torch.abs(out_triton - out_torch)).item()
-        is_close = torch.allclose(out_triton, out_torch, rtol=1e-2, atol=1e-2)
+            run_triton()
+            run_torch()
+            torch.cuda.synchronize()
 
-        if not is_close:
+            max_diff = torch.max(torch.abs(out_triton - out_torch)).item()
+            mean_diff = torch.mean(torch.abs(out_triton - out_torch)).item()
+            is_close = torch.allclose(out_triton, out_torch, rtol=1e-2, atol=1e-2)
+
+            if not is_close:
+                print(
+                    "WARNING: correctness mismatch, "
+                    f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+                )
+
+            t_torch_s = bench_kineto(run_torch, f"torch_gelu_mul_{approximate}")
+            t_triton_s = bench_kineto(run_triton, f"triton_gelu_mul_{approximate}")
+
+            bytes_per_element = gate.element_size() * 3
+            total_bytes = n_elements * bytes_per_element
+
+            triton_gbps = total_bytes / t_triton_s / 1e9
+            torch_gbps = total_bytes / t_torch_s / 1e9
+
+            print("-" * 60)
             print(
-                "WARNING: correctness mismatch, "
-                f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+                f"Triton GELU-Mul : {t_triton_s * 1e6:8.2f} us | "
+                f"Effective Bandwidth: {triton_gbps:8.2f} GB/s"
+            )
+            print(
+                f"PyTorch GELU-Mul: {t_torch_s * 1e6:8.2f} us | "
+                f"Effective Bandwidth: {torch_gbps:8.2f} GB/s"
             )
 
-        t_torch_s = bench_kineto(run_torch, "torch_gelu_mul")
-        t_triton_s = bench_kineto(run_triton, "triton_gelu_mul")
+            if t_triton_s > 0:
+                print(f"Speedup         : {t_torch_s / t_triton_s:8.2f}x")
 
-        bytes_per_element = gate.element_size() * 3
-        total_bytes = n_elements * bytes_per_element
-
-        triton_gbps = total_bytes / t_triton_s / 1e9
-        torch_gbps = total_bytes / t_torch_s / 1e9
-
-        print("-" * 60)
-        print(
-            f"Triton GELU-Mul : {t_triton_s * 1e6:8.2f} us | "
-            f"Effective Bandwidth: {triton_gbps:8.2f} GB/s"
-        )
-        print(
-            f"PyTorch GELU-Mul: {t_torch_s * 1e6:8.2f} us | "
-            f"Effective Bandwidth: {torch_gbps:8.2f} GB/s"
-        )
-
-        if t_triton_s > 0:
-            print(f"Speedup         : {t_torch_s / t_triton_s:8.2f}x")
-
-        print(f"Max Diff        : {max_diff:.6f}")
-        print(f"Mean Diff       : {mean_diff:.6f}")
-        print("-" * 60)
+            print(f"Max Diff        : {max_diff:.6f}")
+            print(f"Mean Diff       : {mean_diff:.6f}")
+            print("-" * 60)
 
 
 def test_gelu_mul_2d_ffn_shape():

@@ -1,3 +1,4 @@
+from .topk import select_topk_row, _select_algorithm, topk as triton_topk
 import torch
 import triton
 import triton.language as tl
@@ -91,6 +92,7 @@ def _moe_select_topk_softmax_kernel(
     stride_wk,
     BLOCK_E: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    USE_SORT: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     expert_offsets = tl.arange(0, BLOCK_E)
@@ -100,23 +102,13 @@ def _moe_select_topk_softmax_kernel(
         router_logits_ptr + token_id * stride_rm + expert_offsets * stride_re,
         mask=expert_mask,
         other=-float("inf"),
-    ).to(tl.float32)
+    )
 
-    topk_logits = tl.full((BLOCK_TOPK,), -float("inf"), dtype=tl.float32)
     topk_offsets = tl.arange(0, BLOCK_TOPK)
-
-    for k in tl.static_range(0, TOP_K):
-        max_logit = tl.max(logits, axis=0)
-        max_mask = logits == max_logit
-        candidate_ids = tl.where(max_mask, expert_offsets, NUM_EXPERTS)
-        expert_id = tl.min(candidate_ids, axis=0)
-
-        tl.store(
-            topk_ids_ptr + token_id * stride_im + k * stride_ik,
-            expert_id,
-        )
-        topk_logits = tl.where(topk_offsets == k, max_logit, topk_logits)
-        logits = tl.where(expert_offsets == expert_id, -float("inf"), logits)
+    topk_logits, expert_ids = select_topk_row(
+        logits, NUM_EXPERTS, TOP_K, BLOCK_E, BLOCK_TOPK, True, USE_SORT)
+    tl.store(topk_ids_ptr + token_id * stride_im + topk_offsets * stride_ik,
+             expert_ids, mask=topk_offsets < TOP_K)
 
     norm_max = tl.max(topk_logits, axis=0)
     topk_exp = tl.exp(topk_logits - norm_max)
@@ -145,6 +137,7 @@ def _moe_select_topk_softmax_counts_kernel(
     stride_wk,
     BLOCK_E: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    USE_SORT: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     expert_offsets = tl.arange(0, BLOCK_E)
@@ -154,24 +147,14 @@ def _moe_select_topk_softmax_counts_kernel(
         router_logits_ptr + token_id * stride_rm + expert_offsets * stride_re,
         mask=expert_mask,
         other=-float("inf"),
-    ).to(tl.float32)
+    )
 
-    topk_logits = tl.full((BLOCK_TOPK,), -float("inf"), dtype=tl.float32)
     topk_offsets = tl.arange(0, BLOCK_TOPK)
-
-    for k in tl.static_range(0, TOP_K):
-        max_logit = tl.max(logits, axis=0)
-        max_mask = logits == max_logit
-        candidate_ids = tl.where(max_mask, expert_offsets, NUM_EXPERTS)
-        expert_id = tl.min(candidate_ids, axis=0)
-
-        tl.store(
-            topk_ids_ptr + token_id * stride_im + k * stride_ik,
-            expert_id,
-        )
-        tl.atomic_add(counts_ptr + expert_id, 1, sem="relaxed")
-        topk_logits = tl.where(topk_offsets == k, max_logit, topk_logits)
-        logits = tl.where(expert_offsets == expert_id, -float("inf"), logits)
+    topk_logits, expert_ids = select_topk_row(
+        logits, NUM_EXPERTS, TOP_K, BLOCK_E, BLOCK_TOPK, True, USE_SORT)
+    tl.store(topk_ids_ptr + token_id * stride_im + topk_offsets * stride_ik,
+             expert_ids, mask=topk_offsets < TOP_K)
+    tl.atomic_add(counts_ptr + expert_ids, 1, mask=topk_offsets < TOP_K, sem="relaxed")
 
     norm_max = tl.max(topk_logits, axis=0)
     topk_exp = tl.exp(topk_logits - norm_max)
@@ -182,6 +165,32 @@ def _moe_select_topk_softmax_counts_kernel(
         weights,
         mask=topk_offsets < TOP_K,
     )
+
+
+@triton.jit
+def _finish_topk_routes(V, Indices, OI, OW, Counts, K: tl.constexpr,
+                        SI0, SI1, SW0, SW1, B: tl.constexpr, COUNT: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    r = tl.arange(0, B)
+    v = tl.load(V + row * K + r, r < K, other=-float("inf")).to(tl.float32)
+    ids = tl.load(Indices + row * K + r, r < K, other=0)
+    exp = tl.exp(v - tl.max(v, 0))
+    weights = exp / tl.sum(exp, 0)
+    tl.store(OI + row * SI0 + r * SI1, ids, r < K)
+    tl.store(OW + row * SW0 + r * SW1, weights, r < K)
+    if COUNT:
+        tl.atomic_add(Counts + ids, 1, mask=r < K, sem="relaxed")
+
+
+def _wide_topk_routes(logits, k, ids, weights, counts=None):
+    # Large rows use bounded tiles instead of oversized shared-memory sorting.
+    with torch.cuda.device(logits.device), torch.no_grad():
+        selected = triton_topk(logits.contiguous(), k)
+        _finish_topk_routes[(logits.shape[0],)](
+            selected.values, selected.indices, ids, weights,
+            counts if counts is not None else ids,
+            k, ids.stride(0), ids.stride(1), weights.stride(0), weights.stride(1),
+            triton.next_power_of_2(k), counts is not None, num_warps=8)
 
 
 def moe_select_topk_softmax(
@@ -206,7 +215,7 @@ def moe_select_topk_softmax(
     assert router_logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
     num_tokens, num_experts = router_logits.shape
-    assert 1 <= top_k <= num_experts
+    assert 1 <= top_k <= num_experts <= 16384
 
     if topk_ids is None:
         topk_ids = torch.empty(
@@ -215,7 +224,7 @@ def moe_select_topk_softmax(
             dtype=torch.int64,
         )
     else:
-        assert topk_ids.is_cuda and topk_ids.shape == (num_tokens, top_k)
+        assert topk_ids.device == router_logits.device and topk_ids.shape == (num_tokens, top_k)
         assert topk_ids.dtype in (torch.int32, torch.int64)
 
     if topk_weights is None:
@@ -225,8 +234,15 @@ def moe_select_topk_softmax(
             dtype=router_logits.dtype,
         )
     else:
-        assert topk_weights.is_cuda and topk_weights.shape == (num_tokens, top_k)
+        assert topk_weights.device == router_logits.device and topk_weights.shape == (num_tokens, top_k)
         assert topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+    if not num_tokens:
+        return topk_ids, topk_weights
+
+    if num_experts > 4096:
+        _wide_topk_routes(router_logits, top_k, topk_ids, topk_weights)
+        return topk_ids, topk_weights
 
     block_e = triton.next_power_of_2(num_experts)
     block_topk = triton.next_power_of_2(top_k)
@@ -234,22 +250,24 @@ def moe_select_topk_softmax(
     if block_e >= 2048:
         num_warps = 8
 
-    _moe_select_topk_softmax_kernel[(num_tokens,)](
-        router_logits,
-        topk_ids,
-        topk_weights,
-        num_experts,
-        top_k,
-        router_logits.stride(0),
-        router_logits.stride(1),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        BLOCK_E=block_e,
-        BLOCK_TOPK=block_topk,
-        num_warps=num_warps,
-    )
+    with torch.cuda.device(router_logits.device):
+        _moe_select_topk_softmax_kernel[(num_tokens,)](
+            router_logits,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            top_k,
+            router_logits.stride(0),
+            router_logits.stride(1),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            BLOCK_E=block_e,
+            BLOCK_TOPK=block_topk,
+            USE_SORT=_select_algorithm(num_experts, top_k) == "sort",
+            num_warps=num_warps,
+        )
 
     return topk_ids, topk_weights
 
@@ -275,7 +293,7 @@ def moe_select_topk_softmax_with_counts(
     if num_experts is None:
         num_experts = router_num_experts
     assert num_experts == router_num_experts
-    assert 1 <= top_k <= num_experts
+    assert 1 <= top_k <= num_experts <= 16384
 
     if topk_ids is None:
         topk_ids = torch.empty(
@@ -284,7 +302,7 @@ def moe_select_topk_softmax_with_counts(
             dtype=torch.int64,
         )
     else:
-        assert topk_ids.is_cuda and topk_ids.shape == (num_tokens, top_k)
+        assert topk_ids.device == router_logits.device and topk_ids.shape == (num_tokens, top_k)
         assert topk_ids.dtype in (torch.int32, torch.int64)
 
     if topk_weights is None:
@@ -294,16 +312,23 @@ def moe_select_topk_softmax_with_counts(
             dtype=router_logits.dtype,
         )
     else:
-        assert topk_weights.is_cuda and topk_weights.shape == (num_tokens, top_k)
+        assert topk_weights.device == router_logits.device and topk_weights.shape == (num_tokens, top_k)
         assert topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
     if counts is None:
         counts = torch.empty((num_experts,), device=router_logits.device, dtype=torch.int64)
     else:
-        assert counts.is_cuda and counts.shape == (num_experts,)
+        assert counts.device == router_logits.device and counts.is_contiguous() and counts.shape == (num_experts,)
         assert counts.dtype == torch.int64
 
-    _zero_int64_triton(counts)
+    with torch.cuda.device(router_logits.device):
+        _zero_int64_triton(counts)
+    if not num_tokens:
+        return topk_ids, topk_weights, counts
+
+    if num_experts > 4096:
+        _wide_topk_routes(router_logits, top_k, topk_ids, topk_weights, counts)
+        return topk_ids, topk_weights, counts
 
     block_e = triton.next_power_of_2(num_experts)
     block_topk = triton.next_power_of_2(top_k)
@@ -311,23 +336,25 @@ def moe_select_topk_softmax_with_counts(
     if block_e >= 2048:
         num_warps = 8
 
-    _moe_select_topk_softmax_counts_kernel[(num_tokens,)](
-        router_logits,
-        topk_ids,
-        topk_weights,
-        counts,
-        num_experts,
-        top_k,
-        router_logits.stride(0),
-        router_logits.stride(1),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        BLOCK_E=block_e,
-        BLOCK_TOPK=block_topk,
-        num_warps=num_warps,
-    )
+    with torch.cuda.device(router_logits.device):
+        _moe_select_topk_softmax_counts_kernel[(num_tokens,)](
+            router_logits,
+            topk_ids,
+            topk_weights,
+            counts,
+            num_experts,
+            top_k,
+            router_logits.stride(0),
+            router_logits.stride(1),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            BLOCK_E=block_e,
+            BLOCK_TOPK=block_topk,
+            USE_SORT=_select_algorithm(num_experts, top_k) == "sort",
+            num_warps=num_warps,
+        )
 
     return topk_ids, topk_weights, counts
 
@@ -426,6 +453,8 @@ def _moe_assign_sorted_positions_kernel(
     expert_cursor_ptr,
     sorted_token_ids_ptr,
     sorted_token_weights_ptr,
+    route_positions_ptr,
+    WRITE_POSITIONS: tl.constexpr,
     T: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -464,6 +493,9 @@ def _moe_assign_sorted_positions_kernel(
 
     sorted_pos = expert_start + local_pos
 
+    if WRITE_POSITIONS:
+        tl.store(route_positions_ptr + offs, sorted_pos, mask=mask)
+
     tl.store(sorted_token_ids_ptr + sorted_pos, token_ids, mask=mask)
     tl.store(sorted_token_weights_ptr + sorted_pos, weights, mask=mask)
 
@@ -477,9 +509,13 @@ def build_moe_dispatch_metadata_fast(
     expert_offsets: torch.Tensor | None = None,
     expert_cursor: torch.Tensor | None = None,
     counts: torch.Tensor | None = None,
+    route_positions: torch.Tensor | None = None,
 ):
     """
     Build MoE dispatch metadata without materializing x_sorted.
+
+    Optional route_positions[T] maps flattened token/rank to sorted position.
+    It is written by the existing dispatch kernel; return values are unchanged.
 
     Returns:
         sorted_token_ids:     [T]
@@ -496,6 +532,15 @@ def build_moe_dispatch_metadata_fast(
     num_tokens, top_k = topk_ids.shape
     T = num_tokens * top_k
     device = topk_ids.device
+
+    if route_positions is not None:
+        if (route_positions.device != device or route_positions.dtype != torch.int64
+                or route_positions.shape != (T,) or not route_positions.is_contiguous()):
+            raise ValueError("route_positions must be contiguous int64[T] on the input device")
+        for tensor in (topk_ids, topk_weights, sorted_token_ids, sorted_token_weights,
+                       expert_offsets, expert_cursor, counts):
+            if tensor is not None and torch._C._overlaps(route_positions, tensor):
+                raise ValueError("route_positions must not share storage with other buffers")
 
     if counts is None:
         counts = moe_count_experts(topk_ids, num_experts)
@@ -547,6 +592,8 @@ def build_moe_dispatch_metadata_fast(
         expert_cursor,
         sorted_token_ids,
         sorted_token_weights,
+        route_positions if route_positions is not None else sorted_token_ids,
+        route_positions is not None,
         T,
         top_k,
         BLOCK_SIZE=block_size,

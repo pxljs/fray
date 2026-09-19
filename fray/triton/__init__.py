@@ -1,3 +1,4 @@
+from .topk import topk
 from .vector_add import vector_add
 from .silu_mul import silu_mul
 from .gelu_mul import gelu_mul
@@ -5,7 +6,7 @@ from .rmsnorm import add_rmsnorm, rmsnorm
 from .rope import rope, rope_, rope_with_k_cache, rope_with_paged_k_cache
 from .softmax import softmax
 from .matmul import matmul
-from .grouped_gemm import grouped_gemm, build_grouped_gemm_metadata
+from .grouped_gemm import grouped_gemm, build_grouped_gemm_metadata, routed_grouped_gemm
 from .fused_moe import (
     fused_moe,
     fused_moe_prepared,
@@ -21,6 +22,7 @@ from .fused_moe import (
 )
 
 __all__ = [
+    "topk",
     "vector_add",
     "silu_mul",
     "gelu_mul",
@@ -33,6 +35,7 @@ __all__ = [
     "softmax",
     "matmul",
     "grouped_gemm",
+    "routed_grouped_gemm",
     "build_grouped_gemm_metadata",
     "fused_moe",
     "fused_moe_prepared",

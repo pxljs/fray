@@ -8,3 +8,4 @@ from .rope import fused_rope
 from .flash_decoding import flash_decoding
 from .flash_mla import flash_mla
 from .utils import get_col_major_tensor
+from .topk import topk

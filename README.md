@@ -248,3 +248,90 @@ fray/
 ## License
 
 License file not included yet.
+
+### Triton Top-K and routed grouped GEMM
+
+```python
+from fray.triton import topk, routed_grouped_gemm
+selected = topk(logits, 16, algorithm="auto")
+output = routed_grouped_gemm(x, expert_weights, logits, top_k=4, combine="auto")
+# x[M,H], expert_weights[E,H,N], logits[M,E] -> output[M,N]
+```
+
+Custom Top-K handles contiguous CUDA FP16/BF16/FP32 last-axis inputs with width
+<= 16384 and every legal K. Auto keeps repeated reduction for small K, adds
+`partial` for width > 1024 and 8 < K <= 64, and otherwise sorts. Partial sorts
+256-element tiles, keeps next_power_of_2(K) candidates per tile, and sorts only
+that candidate pool. Local top-K suffices because an excluded value already has
+at least K better elements in its own tile. Thresholds are provisional; force
+`reduce` (K <= 32), `partial` (1 <= K <= 64), `sort`, or `torch` to benchmark.
+Full sorting uses 4096-element tiles for wide rows and a parallel rank merge.
+Only ceil(min(K,4096)/256) merge programs launch per tile. Searches only visit
+other tiles' first min(K,4096) positions and mask candidates already ranked >= K.
+
+FP16/BF16 comparisons pack native 16-bit ordered values and 16-bit indices into
+32-bit keys. FP32 uses 64-bit keys. Equal values prefer lower indices; signed
+zeros compare equal and NaNs sort first for largest, last for smallest. Returned
+values are read from original input to preserve their bits. Outputs use int64
+indices. Custom sorted=False is allowed to remain sorted. Auto falls back to
+PyTorch for unsupported inputs/autograd; forced custom algorithms reject them.
+
+`workspace=` optionally reuses contiguous same-device torch.uint32 (FP16/BF16)
+or torch.uint64 (FP32) scratch storage, disjoint from input/output. Required
+number of elements is rows * ceil(width/256) * next_power_of_2(K) for partial,
+or rows * ceil(width/4096) * 4096 for tiled sort. Do not reuse concurrently
+across streams. Without workspace the wrapper allocates it. Other custom paths
+do not use scratch. Warm up before graph capture.
+
+The shared selection primitive remains fused with selected-logit softmax and
+expert counts in the MoE routing kernels for up to 4096 experts. Wider expert
+rows use standalone selection plus a normalization/counting kernel. All counts
+are reset per invocation. Nonfinite logits retain ordinary softmax NaN behavior.
+
+`routed_grouped_gemm` now uses GPU-built tile offsets and persistent scheduling,
+with indirect input loads from sorted token IDs. It does not materialize an
+expanded input or call the legacy CPU tile-list builder. GEMM keeps FP16/BF16
+inputs and FP32 accumulation. Its epilogue rounds the projection to input dtype,
+multiplies the routing weight, and rounds the weighted contribution to input
+dtype before combining (matching the previous per-route rounding boundary).
+`combine="atomic"` writes contributions into a zeroed FP32 output, while
+`"staged"` writes weighted route outputs, then gathers them by token using a
+dispatch-produced inverse route map and sums in fixed route order with FP32
+accumulation. It writes the final output dtype directly, without output zeroing,
+FP32 route-buffer conversion or scatter atomics. `"scatter"` retains the old
+FP32 index_add path as an explicit benchmark baseline.
+Both finally cast to input dtype; accumulation can differ slightly from the
+old repeated half-precision accumulation. Auto provisionally uses atomic for
+K <= 4. Warmed calls support CUDA graph capture; intermediate allocation remains.
+The old explicit-metadata `grouped_gemm` API remains available; its legacy
+metadata helper still performs CPU readback. Its dot operands now retain their
+input dtype rather than unconditionally being converted to FP32.
+
+```sh
+.venv/bin/python -m pytest tests/triton/test_topk.py -q
+PYTHONPATH=. .venv/bin/python tests/triton/bench_topk.py
+PYTHONPATH=. .venv/bin/python tests/triton/bench_topk.py --grouped --combine atomic
+PYTHONPATH=. .venv/bin/python tests/triton/bench_topk.py --grouped --combine staged
+PYTHONPATH=. .venv/bin/python tests/triton/bench_topk.py --grouped --combine scatter
+PYTHONPATH=. .venv/bin/python tests/triton/bench_topk.py --breakdown
+```
+
+Standalone timing uses preallocated outputs/scratch and warm CUDA graphs.
+Grouped timing compares complete eager wall time with independent PyTorch
+routing, expert mm and weighted combination. Breakdown separately reports
+routing/counts, dispatch, GPU tile metadata, GEMM/weights, and combination/cast
+with prepared inputs. Atomic outputs are cleared every benchmark invocation;
+these isolated device timings do not sum to eager end-to-end latency.
+SM86/SM89 representative kernels compile offline, including FP16 MMA with FP32
+accumulation. GPU correctness and speedups remain unverified until target-card
+execution; no performance claim is inferred from compilation.
+
+The staged inverse map costs `tokens * top_k * 8` bytes and is written during
+the existing dispatch launch. The gather kernel uses one program per token and
+128 output columns, sequentially accumulating route contributions; it trades
+scatter contention for indexed reads. Which combine wins depends on shape and
+cache behavior and still requires target-GPU measurement. Optional
+`build_moe_dispatch_metadata_fast(..., route_positions=buffer)` fills a
+contiguous int64 `[tokens * top_k]` map from flattened token/rank to sorted row;
+the existing four return values are unchanged. The buffer must have independent
+storage from other inputs/outputs. Atomic mode does not allocate this map.
